@@ -83,7 +83,7 @@ const Entry strings[] = {
     {L"占用最高的进程", L"Top processes"}, // TopProcesses
     {L"系统盘", L"System drive"}, // SystemDrive
     {L"系统信息", L"System info"}, // SystemInfo
-    {L"显存", L"GPU memory"}, // GpuMemory
+    {L"显卡", L"GPU"}, // GpuMemory (settings key remains gpu_memory)
     {L"Wi-Fi", L"Wi-Fi"}, // Wifi
     {L"电池健康", L"Battery health"}, // BatteryHealth
     {L"帧数", L"FPS"}, // Fps
@@ -208,6 +208,9 @@ const Entry strings[] = {
     {L"右侧", L"Right"},
     {L"左侧", L"Left"},
     {L"充满", L"Full"}, // TaskbarFull
+    {L"GPU 温度", L"GPU temp"}, // GpuTemp
+    {L"温度", L"Temp"}, // Temperature
+    {L"GPU°", L"GPU°"}, // TaskbarGpuTemp
 };
 static_assert(sizeof(strings) / sizeof(strings[0]) == static_cast<std::size_t>(Key::Count), "i18n table size");
 Language current = Language::English;

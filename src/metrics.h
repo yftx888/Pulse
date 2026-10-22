@@ -95,6 +95,7 @@ struct Snapshot {
     PowerSchemeKind power_scheme_kind = PowerSchemeKind::Unknown;
     OfflineReason offline_reason = OfflineReason::None;
     double offline_latency_ms = NAN;
+    double gpu_temp_c = NAN;   // 显卡温度（°C），同任务管理器口径（D3DKMT 适配器性能数据）；多块显卡取最高；不支持/显卡休眠/未启用为 NaN
 };
 
 // 网络探测事件（断网 / 恢复），由后端在探测线程里回调；界面负责弹提醒卡片、播放提示音。
@@ -133,6 +134,7 @@ struct Wants {
     bool fps = false;             // 前台帧率（ETW；关闭时不建会话）
     bool power_scheme = false;    // Only the full battery card displays this.
     bool process_count = false;   // Cheap count, independent of the top-three scan.
+    bool gpu_temp = false;
 };
 
 class Metrics {

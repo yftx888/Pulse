@@ -29,6 +29,9 @@ D2D1_COLOR_F NetworkColor(NetState state) {
     return state == NetState::Online ? Charge : state == NetState::Slow ? Drain :
            state == NetState::Offline ? Danger : Faint;
 }
+D2D1_COLOR_F GpuTempColor(const View& v, D2D1_COLOR_F normal) {
+    return v.gpuTempLevel >= 2 ? Danger : v.gpuTempLevel == 1 ? Drain : normal;
+}
 D2D1_RECT_F Rect(float x, float y, float width, float height) {
     return D2D1::RectF(x, y, x + width, y + height);
 }
@@ -670,10 +673,17 @@ void Renderer::Full(const View& v, bool pinned, Button hover, Button pressed) {
             Panel(card);
             const float y = card.top;
             Text(T(Key::GpuMemory), Rect(25, y + 9, content, 18), 11.5f, Muted);
-            Text(T(Key::SharedMemory), Rect(25, y + 33, half - 8, 17), 10.5f, Faint);
-            Text(T(Key::DedicatedMemory), Rect(25 + half, y + 33, content - half, 17), 10.5f, Faint);
-            Text(v.sharedMemory, Rect(25, y + 51, half - 8, 24), 16, Down, true, true);
-            Text(v.dedicatedMemory, Rect(25 + half, y + 51, content - half, 24), 16, Up, true, true);
+            const float column = v.gpuTempVisible ? content / 3 : half;
+            const float secondWidth = v.gpuTempVisible ? column - 8 : content - half;
+            Text(T(Key::SharedMemory), Rect(25, y + 33, column - 8, 17), 10.5f, Faint);
+            Text(T(Key::DedicatedMemory), Rect(25 + column, y + 33, secondWidth, 17), 10.5f, Faint);
+            Text(v.sharedMemory, Rect(25, y + 51, column - 8, 24), 16, Down, true, true);
+            Text(v.dedicatedMemory, Rect(25 + column, y + 51, secondWidth, 24), 16, Up, true, true);
+            if (v.gpuTempVisible) {
+                Text(T(Key::Temperature), Rect(25 + 2 * column, y + 33, column, 17), 10.5f, Faint);
+                Text(v.gpuTemp, Rect(25 + 2 * column, y + 51, column, 24), 16,
+                    GpuTempColor(v, TextColor), true, true);
+            }
             break;
         }
         case FullComponent::Wifi: {
@@ -776,6 +786,7 @@ void Renderer::UpdateCompactLayout() {
         case CompactComponent::Cpu: value(T(Key::Cpu), L"100%"); break;
         case CompactComponent::Memory: value(T(Key::Memory), L"100%"); break;
         case CompactComponent::Gpu: value(T(Key::Gpu), L"100%"); break;
+        case CompactComponent::GpuTemp: value(T(Key::TaskbarGpuTemp), L"150°C"); break;
         case CompactComponent::Network:
             cell.width = std::max(Measure(L"↑ 999.9" + T(Key::CompactM), 10.5f, false, true),
                                   Measure(L"↓ 999.9" + T(Key::CompactM), 10.5f, false, true)) + 2;
@@ -856,6 +867,7 @@ void Renderer::CompactContent(const View& v) {
         case CompactComponent::Cpu: value(T(Key::Cpu), v.cpuValue, Down); break;
         case CompactComponent::Memory: value(T(Key::Memory), v.memoryValue, Up); break;
         case CompactComponent::Gpu: value(T(Key::Gpu), v.gpuUsage, Charge); break;
+        case CompactComponent::GpuTemp: value(T(Key::TaskbarGpuTemp), v.gpuTemp, GpuTempColor(v, Charge)); break;
         case CompactComponent::Network:
         case CompactComponent::DiskIO: {
             const bool network = component == CompactComponent::Network;

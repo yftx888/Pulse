@@ -193,6 +193,7 @@ enum class Key : std::size_t {
     TaskbarEta, TaskbarGpu, TaskbarFrequency, TaskbarFps, TaskbarRead, TaskbarWrite,
     TaskbarPositionMenu, TaskbarPositionAuto, TaskbarPositionRight, TaskbarPositionLeft,
     TaskbarFull,
+    GpuTemp, Temperature, TaskbarGpuTemp,
     Count
 };
 namespace detail {

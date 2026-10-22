@@ -31,8 +31,8 @@ Right-click the window, the taskbar data, or the tray icon and open Show items t
 
 | Mode | Available components |
 | --- | --- |
-| Full mode | CPU / GPU / Memory / Processor, Battery, Power chart, Network, Top processes, Disk speed, System drive usage, System info, GPU memory, Wi-Fi, Battery health, FPS |
-| Mini mode | Battery %, Time left / Full in, Power, CPU %, Memory %, GPU %, Network speed, Latency, Disk, CPU frequency, FPS |
+| Full mode | CPU / GPU / Memory / Processor, Battery, Power chart, Network, Top processes, Disk speed, System drive usage, System info, GPU (memory and temperature), Wi-Fi, Battery health, FPS |
+| Mini mode | Battery %, Time left / Full in, Power, CPU %, Memory %, GPU %, GPU temp, Network speed, Latency, Disk, CPU frequency, FPS |
 | Taskbar mode | Same as Mini mode |
 
 Optional metrics are collected only while their components are enabled; disabling them stops collection. Basic sampling for CPU, memory, battery, and network speed remains active. Network probes run while Disconnect alerts are enabled or the interface shows latency, and stop when neither needs them. System info includes CPU frequency, Memory used / total, Processes, and Uptime.
@@ -40,6 +40,7 @@ Optional metrics are collected only while their components are enabled; disablin
 Other features:
 
 - Foreground app FPS, measured through ETW DXGI/D3D9 Present events, requires administrator privileges. If FPS is enabled without sufficient privileges, the menu offers Restart as administrator (for FPS). Some apps may not expose a readable frame rate.
+- GPU temperature uses the same data source as Task Manager and needs no administrator privileges; with several GPUs, the hottest one is shown. It is usually available on discrete GPUs (NVIDIA / AMD) and AMD integrated graphics; Intel integrated graphics that do not report a temperature show none. It does not wake a sleeping discrete GPU. CPU temperature would require a kernel driver and is not provided.
 - Full mode refreshes every 0.5 / 1 / 2 seconds, with a default of 1 second. Mini mode and Taskbar mode refresh about every 2 seconds.
 - Slow latency threshold can be set to 50 / 100 / 150 / 200 / 300 / 500 / 800 ms, with a default of 500 ms.
 - Network disconnected and Network restored cards fade out after about 8 seconds. Hovering pauses the timer; moving away starts a roughly 3-second timer before they fade out. Disconnect alerts and Alert sound have separate switches. Sleep does not count as an outage.

@@ -56,6 +56,7 @@ Key Label(CompactComponent c, PowerMode mode = PowerMode::Unknown) {
     case CompactComponent::Cpu: return Key::TaskbarCpu;
     case CompactComponent::Memory: return Key::TaskbarMemory;
     case CompactComponent::Gpu: return Key::TaskbarGpu;
+    case CompactComponent::GpuTemp: return Key::TaskbarGpuTemp;
     case CompactComponent::Latency: return Key::TaskbarPing;
     case CompactComponent::CpuFrequency: return Key::TaskbarFrequency;
     default: return Key::TaskbarFps;
@@ -293,6 +294,7 @@ struct TaskbarStrip::Impl {
             fit(L"88:88"); fit(L"59" + T(Key::MinuteSuffix)); fit(L"99+" + T(Key::HourSuffix)); break;
         case CompactComponent::CpuFrequency: fit(L"10.00" + T(Key::GhzSuffix)); break;
         case CompactComponent::Fps: fit(L"8888"); fit(T(Key::RunAsAdmin)); break;
+        case CompactComponent::GpuTemp: fit(L"150°C"); break;
         default: fit(L"100%"); break;
         }
         return std::ceil(result) + 1;
@@ -549,6 +551,8 @@ struct TaskbarStrip::Impl {
                 case CompactComponent::Cpu: value = v.cpuValue; ink = down; break;
                 case CompactComponent::Memory: value = v.memoryValue; ink = up; break;
                 case CompactComponent::Gpu: value = v.gpuUsage; ink = green; break;
+                case CompactComponent::GpuTemp:
+                    value = v.gpuTemp; ink = v.gpuTempLevel >= 2 ? red : v.gpuTempLevel == 1 ? yellow : green; break;
                 case CompactComponent::Latency:
                     value = v.latency; ink = v.netState == NetState::Offline ? red : v.netState == NetState::Slow ? yellow :
                         v.netState == NetState::Checking ? muted : green; break;

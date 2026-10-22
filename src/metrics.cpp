@@ -83,6 +83,9 @@ constexpr unsigned long long kPdhRetryMs = 30000;
 constexpr unsigned long long kDiskEveryMs = 1000;
 constexpr unsigned long long kSysDiskEveryMs = 30000;
 constexpr unsigned long long kGpuMemEveryMs = 3000;
+constexpr unsigned long long kGpuTempEveryMs = 2000;
+constexpr unsigned long long kGpuTempRetryMs = 30000;
+constexpr unsigned long long kGpuTempRediscoverMs = 60000;
 constexpr unsigned long long kWifiEveryMs = 10000;
 constexpr unsigned long long kBatteryHealthEveryMs = 600000;
 constexpr long kRateUnknownAbs = 500000;
@@ -108,6 +111,7 @@ constexpr unsigned kWantBattery = 1u << 10;
 constexpr unsigned kWantFps = 1u << 11;
 constexpr unsigned kWantScheme = 1u << 12;
 constexpr unsigned kWantCount = 1u << 13;
+constexpr unsigned kWantGpuTemp = 1u << 14;
 constexpr unsigned kWantDefault = kWantChip | kWantGpu | kWantProc;
 
 static_assert(sizeof(void*) == 8, "x64 only");
@@ -115,6 +119,111 @@ static_assert(sizeof(BATTERY_INFORMATION) == 36, "BATTERY_INFORMATION size");
 static_assert(offsetof(BATTERY_INFORMATION, DesignedCapacity) == 12, "DesignedCapacity offset");
 static_assert(offsetof(BATTERY_INFORMATION, CycleCount) == 32, "CycleCount offset");
 static_assert(sizeof(BATTERY_QUERY_INFORMATION) == 12, "BATTERY_QUERY_INFORMATION size");
+
+// Windows SDK shared/d3dkmthk.h (Microsoft win32metadata, RecompiledIdlHeaders):
+// https://github.com/microsoft/win32metadata/blob/main/generation/WinSDK/RecompiledIdlHeaders/shared/d3dkmthk.h
+// Local x64 ABI declarations: MinGW's SDK does not provide these newer types.
+// KMTQUERYADAPTERINFOTYPE: ADAPTERTYPE = 15, ADAPTERPERFDATA = 62 (WDDM 2.4+).
+constexpr UINT kPulseKmtAdapterType = 15;
+constexpr UINT kPulseKmtAdapterPerfData = 62;
+// ADAPTERTYPE's UINT bitfield: RenderSupported is bit 0; SoftwareDevice is
+// the third bit (zero-based bit 2), not bit 3. Read masks to avoid bitfield ABI issues.
+constexpr UINT kPulseKmtRenderSupported = 1u << 0;
+constexpr UINT kPulseKmtSoftwareDevice = 1u << 2;
+struct PulseKmtAdapterInfo {
+    UINT hAdapter; // D3DKMT_HANDLE is a 32-bit UINT, not a Win32 HANDLE.
+    LUID AdapterLuid;
+    ULONG NumOfSources;
+    BOOL bPrecisePresentRegionsPreferred;
+};
+struct PulseKmtEnumAdapters2 {
+    ULONG NumAdapters;
+    PulseKmtAdapterInfo* pAdapters;
+};
+struct PulseKmtQueryAdapterInfo {
+    UINT hAdapter;
+    UINT Type;
+    void* pPrivateDriverData;
+    UINT PrivateDriverDataSize;
+};
+struct PulseKmtCloseAdapter { UINT hAdapter; };
+struct PulseKmtAdapterType { UINT Value; };
+struct PulseKmtAdapterPerfData {
+    UINT32 PhysicalAdapterIndex;
+    alignas(8) ULONGLONG MemoryFrequency;
+    ULONGLONG MaxMemoryFrequency;
+    ULONGLONG MaxMemoryFrequencyOC;
+    ULONGLONG MemoryBandwidth;
+    ULONGLONG PCIEBandwidth;
+    ULONG FanRPM;
+    ULONG Power;       // 1 = 0.1% (one thousandth of full power).
+    ULONG Temperature; // 1 = 0.1 degrees Celsius; 0 means unavailable.
+    UCHAR PowerStateOverride;
+};
+static_assert(sizeof(PulseKmtAdapterInfo) == 20, "D3DKMT_ADAPTERINFO size");
+static_assert(offsetof(PulseKmtAdapterInfo, AdapterLuid) == 4, "AdapterLuid offset");
+static_assert(offsetof(PulseKmtAdapterInfo, NumOfSources) == 12, "NumOfSources offset");
+static_assert(offsetof(PulseKmtAdapterInfo, bPrecisePresentRegionsPreferred) == 16, "PrecisePresent offset");
+static_assert(sizeof(PulseKmtEnumAdapters2) == 16, "D3DKMT_ENUMADAPTERS2 size");
+static_assert(offsetof(PulseKmtEnumAdapters2, pAdapters) == 8, "pAdapters offset");
+static_assert(sizeof(PulseKmtQueryAdapterInfo) == 24, "D3DKMT_QUERYADAPTERINFO size");
+static_assert(offsetof(PulseKmtQueryAdapterInfo, Type) == 4, "Query Type offset");
+static_assert(offsetof(PulseKmtQueryAdapterInfo, pPrivateDriverData) == 8, "PrivateDriverData offset");
+static_assert(offsetof(PulseKmtQueryAdapterInfo, PrivateDriverDataSize) == 16, "PrivateDriverDataSize offset");
+static_assert(sizeof(PulseKmtCloseAdapter) == 4, "D3DKMT_CLOSEADAPTER size");
+static_assert(sizeof(PulseKmtAdapterType) == 4, "D3DKMT_ADAPTERTYPE size");
+static_assert(sizeof(PulseKmtAdapterPerfData) == 64, "D3DKMT_ADAPTER_PERFDATA size");
+static_assert(alignof(PulseKmtAdapterPerfData) == 8, "ADAPTER_PERFDATA alignment");
+static_assert(offsetof(PulseKmtAdapterPerfData, MemoryFrequency) == 8, "MemoryFrequency offset");
+static_assert(offsetof(PulseKmtAdapterPerfData, PCIEBandwidth) == 40, "PCIEBandwidth offset");
+static_assert(offsetof(PulseKmtAdapterPerfData, FanRPM) == 48, "FanRPM offset");
+static_assert(offsetof(PulseKmtAdapterPerfData, Power) == 52, "Power offset");
+static_assert(offsetof(PulseKmtAdapterPerfData, Temperature) == 56, "Temperature offset");
+static_assert(offsetof(PulseKmtAdapterPerfData, PowerStateOverride) == 60, "PowerStateOverride offset");
+
+struct PulseKmtApi {
+    // NTSTATUS is a signed 32-bit LONG; NT_SUCCESS(status) means status >= 0.
+    using EnumFn = LONG(WINAPI*)(const PulseKmtEnumAdapters2*);
+    using QueryFn = LONG(WINAPI*)(const PulseKmtQueryAdapterInfo*);
+    using CloseFn = LONG(WINAPI*)(const PulseKmtCloseAdapter*);
+    HMODULE module = nullptr;
+    EnumFn enumerate = nullptr;
+    QueryFn query = nullptr;
+    CloseFn close = nullptr;
+    PulseKmtApi() = default;
+    PulseKmtApi(const PulseKmtApi&) = delete;
+    PulseKmtApi& operator=(const PulseKmtApi&) = delete;
+    ~PulseKmtApi() { Reset(); }
+    bool Load() {
+        if (module) return true;
+        module = LoadLibraryExW(L"gdi32.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (!module) return false;
+        enumerate = reinterpret_cast<EnumFn>(GetProcAddress(module, "D3DKMTEnumAdapters2"));
+        query = reinterpret_cast<QueryFn>(GetProcAddress(module, "D3DKMTQueryAdapterInfo"));
+        close = reinterpret_cast<CloseFn>(GetProcAddress(module, "D3DKMTCloseAdapter"));
+        if (enumerate && query && close) return true;
+        Reset();
+        return false;
+    }
+    void Reset() {
+        if (module) FreeLibrary(module);
+        module = nullptr;
+        enumerate = nullptr;
+        query = nullptr;
+        close = nullptr;
+    }
+};
+
+void PulseKmtCloseAdapters(const PulseKmtApi& api, std::vector<PulseKmtAdapterInfo>& adapters) {
+    for (auto& adapter : adapters) {
+        if (adapter.hAdapter && api.close) {
+            const PulseKmtCloseAdapter request{adapter.hAdapter};
+            api.close(&request);
+        }
+        adapter.hAdapter = 0;
+    }
+    adapters.clear();
+}
 
 struct BatteryReading {
     bool present = false;
@@ -663,6 +772,7 @@ constexpr unsigned PackWants(const Wants& w) {
     if (w.fps) bits |= kWantFps;
     if (w.power_scheme) bits |= kWantScheme;
     if (w.process_count) bits |= kWantCount;
+    if (w.gpu_temp) bits |= kWantGpuTemp;
     return bits;
 }
 
@@ -682,6 +792,7 @@ constexpr Wants UnpackWants(unsigned bits) {
     w.fps = (bits & kWantFps) != 0;
     w.power_scheme = (bits & kWantScheme) != 0;
     w.process_count = (bits & kWantCount) != 0;
+    w.gpu_temp = (bits & kWantGpuTemp) != 0;
     return w;
 }
 
@@ -698,6 +809,9 @@ constexpr Wants FpsWantOnly() {
 static_assert(PackWants(FpsWantOnly()) == kWantFps, "fps want bit");
 static_assert(UnpackWants(kWantFps).fps, "unpack fps");
 static_assert(!UnpackWants(kWantDefault).fps, "default fps off");
+static_assert(UnpackWants(kWantGpuTemp).gpu_temp, "unpack gpu temperature");
+static_assert(PackWants(UnpackWants(kWantGpuTemp)) == kWantGpuTemp, "gpu temperature want bit");
+static_assert(!UnpackWants(kWantDefault).gpu_temp, "default gpu temperature off");
 
 using WlanOpenHandleFn = DWORD(WINAPI*)(DWORD, PVOID, PDWORD, PHANDLE);
 using WlanCloseHandleFn = DWORD(WINAPI*)(HANDLE, PVOID);
@@ -1218,6 +1332,13 @@ struct Metrics::Impl {
     double gpu_shared_mb_ = NAN;
     double gpu_dedicated_mb_ = NAN;
 
+    PulseKmtApi gpu_temp_api_;
+    std::vector<PulseKmtAdapterInfo> gpu_temp_adapters_;
+    bool gpu_temp_ready_ = false, have_gpu_temp_due_ = false;
+    bool gpu_temp_seen_ = false;
+    unsigned long long gpu_temp_due_ = 0, gpu_temp_retry_at_ = 0, gpu_temp_enum_at_ = 0;
+    double gpu_temp_c_ = NAN;
+
     HMODULE wifi_mod_ = nullptr;
     HANDLE wifi_client_ = nullptr;
     WlanOpenHandleFn wifi_open_ = nullptr;
@@ -1259,6 +1380,7 @@ private:
     void ReleaseCpuQuery();
     void ReleaseCpuFreq();
     void ReleaseGpuMem();
+    void ReleaseGpuTemp();
     void ReleaseWifi();
     void ReleaseSysDisk();
     void ReleaseBatteryHealth();
@@ -1279,6 +1401,7 @@ private:
     void UpdateCpuFreq(Snapshot& s);
     void UpdateUptime(Snapshot& s);
     void UpdateGpuMemory(unsigned long long now, Snapshot& s);
+    void UpdateGpuTemp(unsigned long long now, Snapshot& s);
     void UpdateWifi(unsigned long long now, Snapshot& s);
     void UpdateBatteryHealth(unsigned long long now, Snapshot& s);
     void UpdateFps(Snapshot& s, unsigned long long now);
@@ -1289,6 +1412,7 @@ private:
     bool EnsureCpuUtility(unsigned long long now);
     bool EnsureCpuFreq(unsigned long long now);
     bool EnsureGpuMem(unsigned long long now);
+    bool EnsureGpuTemp(unsigned long long now);
     bool EnsureWifi(unsigned long long now);
     bool ReadEnergy(bool full);
     bool ReadGpu(double& out);
@@ -1811,6 +1935,7 @@ void Metrics::Impl::CloseQueries() {
     ReleaseDisk();
     ReleaseCpuQuery();
     ReleaseGpuMem();
+    ReleaseGpuTemp();
     ReleaseWifi();
     ReleaseProcs();
     ReleaseSysDisk();
@@ -1852,6 +1977,7 @@ void Metrics::Impl::ClearTurnedOff(Snapshot& s, const Wants& w) {
     }
     if (!w.cpu_freq) s.cpu_mhz = NAN;
     if (!w.uptime) s.uptime_s = NAN;
+    if (!w.gpu_temp) s.gpu_temp_c = NAN;
     if (!w.gpu_memory) {
         s.gpu_shared_mem_mb = NAN;
         s.gpu_dedicated_mem_mb = NAN;
@@ -1970,6 +2096,17 @@ void Metrics::Impl::ReleaseGpuMem() {
     gpu_dedicated_mb_ = NAN;
 }
 
+void Metrics::Impl::ReleaseGpuTemp() {
+    if (!gpu_temp_api_.module && !gpu_temp_ready_ && !have_gpu_temp_due_ &&
+        gpu_temp_adapters_.empty() && gpu_temp_retry_at_ == 0) return;
+    PulseKmtCloseAdapters(gpu_temp_api_, gpu_temp_adapters_);
+    std::vector<PulseKmtAdapterInfo>().swap(gpu_temp_adapters_);
+    gpu_temp_api_.Reset();
+    gpu_temp_ready_ = have_gpu_temp_due_ = gpu_temp_seen_ = false;
+    gpu_temp_due_ = gpu_temp_retry_at_ = gpu_temp_enum_at_ = 0;
+    gpu_temp_c_ = NAN;
+}
+
 void Metrics::Impl::ReleaseWifi() {
     if (!wifi_mod_ && !wifi_client_ && !have_wifi_due_ && wifi_ssid_.empty() && wifi_signal_ < 0) return;
     if (wifi_client_ && wifi_close_) wifi_close_(wifi_client_, nullptr);
@@ -2075,6 +2212,48 @@ bool Metrics::Impl::EnsureGpuMem(unsigned long long now) {
     };
     gpu_mem_ok_ = OpenEnglishQuery(gpu_mem_query_, binds, 2);
     return gpu_mem_ok_;
+}
+
+bool Metrics::Impl::EnsureGpuTemp(unsigned long long now) {
+    if (gpu_temp_ready_) return true;
+    if (now < gpu_temp_retry_at_) return false;
+    diagnostics::ScopedTiming timing(L"D3DKMT GPU adapters");
+    gpu_temp_retry_at_ = now + kGpuTempRetryMs;
+    if (!gpu_temp_api_.Load()) return false;
+    PulseKmtEnumAdapters2 request{};
+    // The first call returns the supported capacity without opening handles.
+    if (gpu_temp_api_.enumerate(&request) < 0 || request.NumAdapters > 4096) return false;
+    gpu_temp_adapters_.assign(request.NumAdapters, PulseKmtAdapterInfo{});
+    if (request.NumAdapters != 0) {
+        request.pAdapters = gpu_temp_adapters_.data();
+        const LONG status = gpu_temp_api_.enumerate(&request);
+        // NumAdapters is undefined on failure: inspect only our zero-initialized
+        // allocation when closing any partially returned handles.
+        if (status < 0 || request.NumAdapters > gpu_temp_adapters_.size()) {
+            PulseKmtCloseAdapters(gpu_temp_api_, gpu_temp_adapters_);
+            return false;
+        }
+        for (auto& adapter : gpu_temp_adapters_) {
+            if (!adapter.hAdapter) continue;
+            PulseKmtAdapterType type{};
+            const PulseKmtQueryAdapterInfo query{adapter.hAdapter, kPulseKmtAdapterType,
+                &type, static_cast<UINT>(sizeof(type))};
+            if (gpu_temp_api_.query(&query) < 0) {
+                PulseKmtCloseAdapters(gpu_temp_api_, gpu_temp_adapters_);
+                return false;
+            }
+            if ((type.Value & kPulseKmtSoftwareDevice) || !(type.Value & kPulseKmtRenderSupported)) {
+                const PulseKmtCloseAdapter close{adapter.hAdapter};
+                gpu_temp_api_.close(&close);
+                adapter.hAdapter = 0;
+            }
+        }
+        gpu_temp_adapters_.erase(std::remove_if(gpu_temp_adapters_.begin(), gpu_temp_adapters_.end(),
+            [](const PulseKmtAdapterInfo& adapter) { return adapter.hAdapter == 0; }), gpu_temp_adapters_.end());
+    }
+    gpu_temp_ready_ = true;
+    gpu_temp_enum_at_ = now;
+    return true;
 }
 
 bool Metrics::Impl::EnsureWifi(unsigned long long now) {
@@ -2381,6 +2560,51 @@ void Metrics::Impl::UpdateGpuMemory(unsigned long long now, Snapshot& s) {
     s.gpu_dedicated_mem_mb = gpu_dedicated_mb_;
 }
 
+void Metrics::Impl::UpdateGpuTemp(unsigned long long now, Snapshot& s) {
+    if ((have_gpu_temp_due_ && now < gpu_temp_due_) ||
+        (!gpu_temp_ready_ && now < gpu_temp_retry_at_)) {
+        s.gpu_temp_c = gpu_temp_c_;
+        return;
+    }
+    gpu_temp_due_ = NextDue(have_gpu_temp_due_, gpu_temp_due_, now, kGpuTempEveryMs);
+    have_gpu_temp_due_ = true;
+    // An unsupported/sleeping GPU may become available later. Keep handles for
+    // two-second samples; only rediscover once a minute until any value is valid.
+    if (gpu_temp_ready_ && !gpu_temp_seen_ && now - gpu_temp_enum_at_ >= kGpuTempRediscoverMs) {
+        PulseKmtCloseAdapters(gpu_temp_api_, gpu_temp_adapters_);
+        gpu_temp_ready_ = false;
+    }
+    gpu_temp_c_ = NAN;
+    if (EnsureGpuTemp(now)) {
+        diagnostics::ScopedTiming timing(L"D3DKMT GPU temperature");
+        ULONG hottest = 0;
+        bool failed = false;
+        for (const auto& adapter : gpu_temp_adapters_) {
+            PulseKmtAdapterPerfData data{};
+            data.PhysicalAdapterIndex = 0;
+            const PulseKmtQueryAdapterInfo query{adapter.hAdapter, kPulseKmtAdapterPerfData,
+                &data, static_cast<UINT>(sizeof(data))};
+            if (gpu_temp_api_.query(&query) < 0) {
+                failed = true;
+                break;
+            }
+            if (data.Temperature > 0 && data.Temperature < 1500)
+                hottest = std::max(hottest, data.Temperature);
+        }
+        if (failed) {
+            // Driver resets/hotplug invalidate the whole enumeration. Discard
+            // this round, even if another adapter already returned a value.
+            PulseKmtCloseAdapters(gpu_temp_api_, gpu_temp_adapters_);
+            gpu_temp_ready_ = false;
+            gpu_temp_retry_at_ = GetTickCount64() + kGpuTempRetryMs;
+        } else if (hottest != 0) {
+            gpu_temp_c_ = hottest / 10.0;
+            gpu_temp_seen_ = true;
+        }
+    }
+    s.gpu_temp_c = gpu_temp_c_;
+}
+
 void Metrics::Impl::UpdateWifi(unsigned long long now, Snapshot& s) {
     if (have_wifi_due_ && now < wifi_due_) {
         s.wifi_ssid = wifi_ssid_;
@@ -2556,6 +2780,7 @@ Snapshot Metrics::Impl::Take(bool full) {
     if (!wants.disk_io) ReleaseDisk();
     if (!wants.cpu_freq) ReleaseCpuFreq();
     if (!wants.gpu_memory) ReleaseGpuMem();
+    if (!wants.gpu_temp) ReleaseGpuTemp();
     if (!wants.wifi) ReleaseWifi();
     if (!wants.sys_disk) ReleaseSysDisk();
     if (!wants.battery_health) ReleaseBatteryHealth();
@@ -2644,6 +2869,7 @@ Snapshot Metrics::Impl::Take(bool full) {
     if (wants.sys_disk) UpdateSysDisk(now, s);
     if (wants.uptime) UpdateUptime(s);
     if (wants.gpu_memory) UpdateGpuMemory(now, s);
+    if (wants.gpu_temp) UpdateGpuTemp(now, s);
     if (wants.wifi) UpdateWifi(now, s);
     if (wants.battery_health) UpdateBatteryHealth(now, s);
     if (wants.fps) UpdateFps(s, now);

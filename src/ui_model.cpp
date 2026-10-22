@@ -8,6 +8,9 @@
 
 namespace pulse::ui {
 namespace {
+// Both the floating window and the taskbar own a Model. All model updates are
+// on the UI thread; share this lifetime flag across modes, components and models.
+bool gpuTempSeen = false;
 bool Known(double v) { return std::isfinite(v) && v >= 0; }
 float Fraction(double v) {
     return Known(v) ? static_cast<float>(std::round(std::clamp(v, 0.0, 100.0)) / 100.0) : -1.0f;
@@ -134,6 +137,7 @@ Wants CollectionWants(const Components& components, DisplayMode display, bool de
     w.cpu_freq = compact ? c.Enabled(CompactComponent::CpuFrequency) : c.Enabled(FullComponent::SystemInfo);
     w.uptime = !compact && c.Enabled(FullComponent::SystemInfo);
     w.gpu_memory = !compact && c.Enabled(FullComponent::GpuMemory);
+    w.gpu_temp = compact ? c.Enabled(CompactComponent::GpuTemp) : c.Enabled(FullComponent::GpuMemory);
     w.wifi = !compact && c.Enabled(FullComponent::Wifi);
     w.battery_health = !compact && c.Enabled(FullComponent::BatteryHealth);
     w.fps = compact ? c.Enabled(CompactComponent::Fps) : c.Enabled(FullComponent::Fps);
@@ -144,6 +148,7 @@ Wants CollectionWants(const Components& components, DisplayMode display, bool de
         w.disk_io = w.disk_io || strip.disk_io;
         w.cpu_freq = w.cpu_freq || strip.cpu_freq;
         w.fps = w.fps || strip.fps;
+        w.gpu_temp = w.gpu_temp || strip.gpu_temp;
     }
     return w;
 }
@@ -164,6 +169,8 @@ bool View::Equals(const View& r, bool compact, const Components& c) const {
         if (c.Enabled(CompactComponent::Cpu) && cpuValue != r.cpuValue) return false;
         if (c.Enabled(CompactComponent::Memory) && memoryValue != r.memoryValue) return false;
         if (c.Enabled(CompactComponent::Gpu) && gpuUsage != r.gpuUsage) return false;
+        if (c.Enabled(CompactComponent::GpuTemp) &&
+            std::tie(gpuTemp, gpuTempLevel) != std::tie(r.gpuTemp, r.gpuTempLevel)) return false;
         if (c.Enabled(CompactComponent::Network) &&
             std::tie(compactUp, compactDown) != std::tie(r.compactUp, r.compactDown)) return false;
         if (c.Enabled(CompactComponent::Latency) &&
@@ -199,7 +206,8 @@ bool View::Equals(const View& r, bool compact, const Components& c) const {
         std::tie(cpuFrequency, memoryDetail, processCount, uptime) !=
         std::tie(r.cpuFrequency, r.memoryDetail, r.processCount, r.uptime)) return false;
     if (c.Enabled(FullComponent::GpuMemory) &&
-        std::tie(sharedMemory, dedicatedMemory) != std::tie(r.sharedMemory, r.dedicatedMemory)) return false;
+        std::tie(sharedMemory, dedicatedMemory, gpuTempVisible, gpuTemp, gpuTempLevel) !=
+        std::tie(r.sharedMemory, r.dedicatedMemory, r.gpuTempVisible, r.gpuTemp, r.gpuTempLevel)) return false;
     if (c.Enabled(FullComponent::Wifi) &&
         std::tie(wifi, wifiSsid, wifiSignal) != std::tie(r.wifi, r.wifiSsid, r.wifiSignal)) return false;
     if (c.Enabled(FullComponent::BatteryHealth) &&
@@ -242,6 +250,15 @@ void Model::BreakHistory() {
 }
 bool Model::Update(const Snapshot& s, bool compact, const Components& c, bool taskbar) {
     View v;
+    const bool validTemp = std::isfinite(s.gpu_temp_c) && s.gpu_temp_c > 0 && s.gpu_temp_c < 150;
+    if (validTemp) gpuTempSeen = true;
+    if (compact ? c.Enabled(CompactComponent::GpuTemp) : c.Enabled(FullComponent::GpuMemory)) {
+        v.gpuTempVisible = gpuTempSeen;
+        if (compact || v.gpuTempVisible) {
+            v.gpuTemp = validTemp ? Number(s.gpu_temp_c, 0) + L"°C" : L"--";
+            v.gpuTempLevel = validTemp ? (s.gpu_temp_c >= 85 ? 2 : s.gpu_temp_c >= 70 ? 1 : 0) : 0;
+        }
+    }
     const bool battery = compact ? c.Enabled(CompactComponent::Battery) : c.Enabled(FullComponent::Battery);
     const bool eta = compact && c.Enabled(CompactComponent::Eta);
     const bool power = compact && c.Enabled(CompactComponent::Power);

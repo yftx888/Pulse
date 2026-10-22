@@ -17,7 +17,7 @@ enum class FullComponent : std::size_t {
     SystemInfo, GpuMemory, Wifi, BatteryHealth, Fps, Count
 };
 enum class CompactComponent : std::size_t {
-    Battery, Eta, Power, Cpu, Memory, Gpu, Network, Latency, DiskIO, CpuFrequency, Fps, Count
+    Battery, Eta, Power, Cpu, Memory, Gpu, Network, Latency, DiskIO, CpuFrequency, Fps, GpuTemp, Count
 };
 struct ComponentInfo {
     const wchar_t* key;
@@ -50,7 +50,8 @@ inline constexpr std::array<ComponentInfo, static_cast<std::size_t>(CompactCompo
     {L"latency", Key::Latency, true, 75},
     {L"disk_io", Key::DiskIO, false, 0},
     {L"cpu_freq", Key::CpuFrequency, false, 89},
-    {L"fps", Key::FpsShort, false, 57}
+    {L"fps", Key::FpsShort, false, 57},
+    {L"gpu_temp", Key::GpuTemp, false, 64}
 }};
 inline constexpr std::array<FullComponent, FullComponents.size()> FullOrder{{
     FullComponent::Hardware, FullComponent::Battery, FullComponent::PowerChart,
@@ -111,6 +112,9 @@ struct View {
     std::wstring diskPercent, diskFree, cpuFrequency, memoryDetail, processCount, uptime;
     std::wstring sharedMemory, dedicatedMemory, wifiSsid, wifiSignal, health, cycles, fps;
     bool fpsAdmin = false;
+    std::wstring gpuTemp;
+    bool gpuTempVisible = false; // Any UI model has seen a valid value in this run.
+    int gpuTempLevel = 0; // 0 normal/unknown, 1 >= 70 C, 2 >= 85 C.
     Speed down, up, read, write;
     std::vector<Process> processes;
     std::vector<float> powerHistory; // Allocated only while the chart is visible.
