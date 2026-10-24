@@ -294,11 +294,13 @@ try {
     Write-Host ("已创建开始菜单快捷方式：`"{0}`"" -f $startLink)
 
     if ($createDesktop) {
-        $desktop = [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::Desktop)
-        if ([string]::IsNullOrWhiteSpace($desktop)) {
+        # 变量名不能叫 $desktop：与 param 里的 [switch]$Desktop 同名（PowerShell 变量名不区分大小写），
+        # 给 switch 参数变量赋字符串会抛类型转换异常。
+        $desktopPath = [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::Desktop)
+        if ([string]::IsNullOrWhiteSpace($desktopPath)) {
             Fail '无法确定桌面目录。'
         }
-        $desktopLink = Join-Path $desktop 'Pulse.lnk'
+        $desktopLink = Join-Path $desktopPath 'Pulse.lnk'
         New-PulseShortcut -ShortcutPath $desktopLink -Target $dest
         Write-Host ("已创建桌面快捷方式：`"{0}`"" -f $desktopLink)
     } else {
