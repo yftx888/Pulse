@@ -225,6 +225,8 @@ const Entry strings[] = {
     {L"无法写入功耗诊断：{0}", L"Could not write the power diagnostic: {0}"}, // PowerDiagnosticsFailed
     {L"诊断已写入，但无法打开文件：{0}", L"The diagnostic was written, but the file could not be opened: {0}"}, // PowerDiagnosticsOpenFailed
     {L"无法启动功耗诊断（错误码：{0}）。", L"Could not start power diagnostics (error {0})."}, // PowerDiagnosticsLaunchFailed
+    {L"独显 ", L"dGPU "}, // DgpuPrefix
+    {L"独显休眠", L"dGPU idle"}, // DgpuSleeping
 };
 static_assert(sizeof(strings) / sizeof(strings[0]) == static_cast<std::size_t>(Key::Count), "i18n table size");
 Language current = Language::English;

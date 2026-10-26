@@ -208,6 +208,8 @@ enum class Key : std::size_t {
     PowerDiagnosticsFailed,
     PowerDiagnosticsOpenFailed,
     PowerDiagnosticsLaunchFailed,
+    DgpuPrefix,
+    DgpuSleeping,
     Count
 };
 namespace detail {

@@ -1,6 +1,7 @@
 // Console profiler: --samples N (default 60), --compact, --brief, --url URL,
 // --interval-ms 500|1000|2000, --switch-every N, --slow-ms 300|500|800, --fps,
 // --no-probe, --process-count-only, --gpu (five direct D3DKMT diagnostic rounds),
+// --nvml (manual NVML diagnostic; may wake a sleeping GPU),
 // --power (manual PDH/plan/battery report; does not start Metrics or the network).
 // Timings are per actual collection, not per cached Sample() call.
 // g++ -std=c++17 -O2 -municode -static -finput-charset=UTF-8 -fexec-charset=UTF-8
@@ -102,6 +103,25 @@ static_assert(offsetof(PulseKmtAdapterPerfData, Power) == 52, "Power offset");
 static_assert(offsetof(PulseKmtAdapterPerfData, Temperature) == 56, "Temperature offset");
 static_assert(offsetof(PulseKmtAdapterPerfData, PowerStateOverride) == 60, "PowerStateOverride offset");
 
+// ADAPTERADDRESS = 6; PHYSICALADAPTERDEVICEIDS = 31 (same SDK header above).
+constexpr UINT kPulseKmtAdapterAddress = 6;
+constexpr UINT kPulseKmtPhysicalDeviceIds = 31;
+struct PulseKmtAdapterAddress { UINT BusNumber, DeviceNumber, FunctionNumber; };
+struct PulseKmtDeviceIds { UINT VendorID, DeviceID, SubVendorID, SubSystemID, RevisionID, BusType; };
+struct PulseKmtQueryDeviceIds { UINT PhysicalAdapterIndex; PulseKmtDeviceIds DeviceIds; };
+static_assert(sizeof(PulseKmtAdapterAddress) == 12, "ADAPTERADDRESS size");
+static_assert(offsetof(PulseKmtAdapterAddress, DeviceNumber) == 4, "DeviceNumber offset");
+static_assert(offsetof(PulseKmtAdapterAddress, FunctionNumber) == 8, "FunctionNumber offset");
+static_assert(sizeof(PulseKmtDeviceIds) == 24, "DEVICE_IDS size");
+static_assert(offsetof(PulseKmtDeviceIds, VendorID) == 0, "VendorID offset");
+static_assert(offsetof(PulseKmtDeviceIds, DeviceID) == 4, "DeviceID offset");
+static_assert(offsetof(PulseKmtDeviceIds, SubVendorID) == 8, "SubVendorID offset");
+static_assert(offsetof(PulseKmtDeviceIds, SubSystemID) == 12, "SubSystemID offset");
+static_assert(offsetof(PulseKmtDeviceIds, RevisionID) == 16, "RevisionID offset");
+static_assert(offsetof(PulseKmtDeviceIds, BusType) == 20, "BusType offset");
+static_assert(sizeof(PulseKmtQueryDeviceIds) == 28, "QUERY_DEVICE_IDS size");
+static_assert(offsetof(PulseKmtQueryDeviceIds, DeviceIds) == 4, "DeviceIds offset");
+
 struct PulseKmtApi {
     // NTSTATUS is a signed 32-bit LONG; NT_SUCCESS(status) means status >= 0.
     using EnumFn = LONG(WINAPI*)(const PulseKmtEnumAdapters2*);
@@ -152,7 +172,7 @@ struct TimingRow {
     unsigned long long count = 0;
     double wall = 0, cpu = 0, max_wall = 0, max_cpu = 0;
 };
-std::array<TimingRow, 26> g_timings{{
+std::array<TimingRow, 29> g_timings{{
     {L"Battery"}, {L"Power scheme"}, {L"PDH Energy Meter"}, {L"PDH GPU Engine"},
     {L"Network throughput"}, {L"NIC discovery (within throughput)"}, {L"CPU"}, {L"Memory"},
     {L"Process scan"}, {L"Network view (no HTTP)"}, {L"Sample total (includes stages)"},
@@ -160,7 +180,8 @@ std::array<TimingRow, 26> g_timings{{
     {L"Memory detail"}, {L"PDH Disk IO"}, {L"System disk"}, {L"PDH CPU frequency"},
     {L"Uptime"}, {L"PDH GPU memory"}, {L"Wi-Fi"}, {L"Battery health"},
     {L"PDH CPU utility (shared query)"}, {L"FPS"},
-    {L"D3DKMT GPU adapters"}, {L"D3DKMT GPU temperature"}
+    {L"D3DKMT GPU adapters"}, {L"D3DKMT GPU temperature"},
+    {L"CfgMgr dGPU gate"}, {L"NVML init"}, {L"NVML power"}
 }};
 
 void OnTiming(const wchar_t* name, double wall, double cpu, void*) {
@@ -375,6 +396,8 @@ void PrintSample(int index, const pulse::Snapshot& s) {
     PrintDouble(L"gpu_shared_mem_mb", s.gpu_shared_mem_mb);
     PrintDouble(L"gpu_dedicated_mem_mb", s.gpu_dedicated_mem_mb);
     PrintDouble(L"gpu_temp_c", s.gpu_temp_c);
+    PrintText(L"dgpu_status", pulse::DgpuStatusName(s.dgpu_status));
+    PrintDouble(L"dgpu_w", s.dgpu_w);
     PrintText(L"wifi_ssid", s.wifi_ssid);
     PrintInt(L"wifi_signal", s.wifi_signal);
     PrintDouble(L"battery_health_percent", s.battery_health_percent);
@@ -403,6 +426,7 @@ static_assert(offsetof(PulseKmtAdapterRegistryInfo, DacType) == 1040, "DacType o
 static_assert(offsetof(PulseKmtAdapterRegistryInfo, ChipType) == 1560, "ChipType offset");
 
 int RunGpuTest() {
+    std::wprintf(L"%ls\n", pulse::BuildDgpuGateDiagnosticsReport().c_str());
     std::wprintf(L"GPU 诊断：gdi32 D3DKMT，每秒一轮，共 5 轮；不创建 D3D 设备，无需管理员。\n"
                  L"Type=15, RegistryInfo=8, PerfData=62; Temperature 单位 0.1°C；0 或查询失败表示不可用。\n"
                  L"SoftwareDevice mask=0x4, RenderSupported mask=0x1; Power 原始单位为 0.1%%。\n");
@@ -451,6 +475,14 @@ int RunGpuTest() {
             const PulseKmtQueryAdapterInfo type_query{adapter.hAdapter, kPulseKmtAdapterType,
                 &type, static_cast<UINT>(sizeof(type))};
             const LONG type_status = api.query(&type_query);
+            PulseKmtAdapterAddress address{};
+            PulseKmtQueryDeviceIds ids{};
+            const PulseKmtQueryAdapterInfo address_query{adapter.hAdapter, kPulseKmtAdapterAddress,
+                &address, static_cast<UINT>(sizeof(address))};
+            const PulseKmtQueryAdapterInfo ids_query{adapter.hAdapter, kPulseKmtPhysicalDeviceIds,
+                &ids, static_cast<UINT>(sizeof(ids))};
+            const LONG address_status = api.query(&address_query);
+            const LONG ids_status = api.query(&ids_query);
             PulseKmtAdapterRegistryInfo registry{};
             const PulseKmtQueryAdapterInfo registry_query{adapter.hAdapter, kPulseKmtAdapterRegistryInfo,
                 &registry, static_cast<UINT>(sizeof(registry))};
@@ -476,6 +508,10 @@ int RunGpuTest() {
             std::wprintf(L"    NTSTATUS: type=0x%08lX registry=0x%08lX perf=0x%08lX\n",
                 static_cast<unsigned long>(type_status), static_cast<unsigned long>(registry_status),
                 static_cast<unsigned long>(perf_status));
+            std::wprintf(L"    VendorID=0x%04X Bus=%u Device=%u Function=%u NVIDIA=%ls address_rc=0x%08lX ids_rc=0x%08lX\n",
+                ids.DeviceIds.VendorID, address.BusNumber, address.DeviceNumber, address.FunctionNumber,
+                ids_status < 0 ? L"unknown" : ids.DeviceIds.VendorID == 0x10DE ? L"yes" : L"no",
+                static_cast<unsigned long>(address_status), static_cast<unsigned long>(ids_status));
             std::wprintf(L"    Temperature=%lu (%.1f°C) FanRPM=%lu Power=%lu (%.1f%%) perf_ms=%.4f\n",
                 data.Temperature, celsius, data.FanRPM, data.Power, data.Power / 10.0, elapsed);
         }
@@ -540,7 +576,7 @@ void OnNet(const pulse::NetEvent& event, void*) {
 int wmain(int argc, wchar_t** argv) {
     _setmode(_fileno(stdout), _O_U16TEXT);
     int samples = 60, interval_ms = 1000, switch_every = 0;
-    bool full = true, brief = false, fps_test = false, no_probe = false, count_only = false, gpu_test = false, power_test = false;
+    bool full = true, brief = false, fps_test = false, no_probe = false, count_only = false, gpu_test = false, power_test = false, nvml_test = false;
     pulse::Settings settings;
     for (int i = 1; i < argc; ++i) {
         if (std::wcscmp(argv[i], L"--compact") == 0) full = false;
@@ -548,6 +584,7 @@ int wmain(int argc, wchar_t** argv) {
         else if (std::wcscmp(argv[i], L"--no-probe") == 0) no_probe = true;
         else if (std::wcscmp(argv[i], L"--process-count-only") == 0) count_only = true;
         else if (std::wcscmp(argv[i], L"--gpu") == 0) gpu_test = true;
+        else if (std::wcscmp(argv[i], L"--nvml") == 0) nvml_test = true;
         else if (std::wcscmp(argv[i], L"--power") == 0) power_test = true;
         else if (std::wcscmp(argv[i], L"--url") == 0 && i + 1 < argc)
             settings.probe_urls.emplace_back(argv[++i]);
@@ -574,9 +611,17 @@ int wmain(int argc, wchar_t** argv) {
             if (!end || *end || value < 1 || value > 86400) return 2;
             switch_every = static_cast<int>(value);
         } else {
-            std::wprintf(L"Usage: metrics_selftest.exe [--samples N] [--compact] [--brief] [--interval-ms 500|1000|2000] [--switch-every N] [--slow-ms 300|500|800] [--url URL ...] [--fps] [--gpu] [--power] [--no-probe] [--process-count-only]\n");
+            std::wprintf(L"Usage: metrics_selftest.exe [--samples N] [--compact] [--brief] [--interval-ms 500|1000|2000] [--switch-every N] [--slow-ms 300|500|800] [--url URL ...] [--fps] [--gpu] [--nvml] [--power] [--no-probe] [--process-count-only]\n");
             return 2;
         }
+    }
+    if (nvml_test) {
+        const auto report = pulse::BuildDgpuDiagnosticsReport(true, [](const std::wstring& gate) {
+            std::wprintf(L"%ls", gate.c_str());
+            std::fflush(stdout); // Show the warning before NVML can wake the GPU.
+        });
+        std::wprintf(L"%ls\n", report.c_str());
+        return 0;
     }
     if (power_test) {
         std::wprintf(L"%ls\n", pulse::BuildPowerDiagnosticsReport().c_str());
@@ -600,13 +645,13 @@ int wmain(int argc, wchar_t** argv) {
             w.memory_detail = w.disk_io = w.sys_disk = w.cpu_freq = detailed;
             w.uptime = w.gpu_memory = w.wifi = w.battery_health = detailed;
             w.power_scheme = w.process_count = detailed;
-            w.gpu_temp = detailed;
+            w.gpu_temp = w.dgpu_power = detailed;
             if (count_only) {
                 w.chip_power = w.gpu_usage = w.processes = false;
                 w.memory_detail = w.disk_io = w.sys_disk = w.cpu_freq = false;
                 w.uptime = w.gpu_memory = w.wifi = w.battery_health = w.power_scheme = false;
                 w.process_count = true;
-                w.gpu_temp = false;
+                w.gpu_temp = w.dgpu_power = false;
             }
             return w;
         };

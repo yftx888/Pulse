@@ -20,6 +20,7 @@
 #endif
 
 #include "netprobe.h"
+#include "probe_status.h"
 
 #include <windows.h>
 #include <winhttp.h>
@@ -233,6 +234,10 @@ struct ProbeRequest {
     HINTERNET connection = nullptr;
     ProbeContext* probe = nullptr;
     bool receiving = false;
+    bool http_checked = false;
+    bool http_known = false;
+    DWORD http_status = 0;
+    DWORD http_error = ERROR_SUCCESS;
     std::size_t url_index = 0;
     std::int64_t start_tick = 0;
     const wchar_t* step = L"create";
@@ -747,7 +752,7 @@ private:
                     const ProbeContext* p = item->probe;
                     const bool headers = p && p->headers.load(std::memory_order_acquire);
                     const bool failed = p && p->failed.load(std::memory_order_acquire);
-                    const DWORD error = headers ? ERROR_SUCCESS : failed ?
+                    const DWORD error = item->http_error ? item->http_error : headers ? ERROR_SUCCESS : failed ?
                         p->error.load(std::memory_order_relaxed) : item->setup_error ? item->setup_error : fallback;
                     const std::int64_t end = p && (headers || failed) ?
                         p->response_tick.load(std::memory_order_relaxed) : ProbeClockNow();
@@ -757,7 +762,9 @@ private:
                         L" error=" + std::to_wstring(error) + L" api=" +
                         std::to_wstring(p ? static_cast<unsigned long long>(p->error_api.load(std::memory_order_relaxed)) : 0ULL) +
                         L" elapsed_ms=" + std::to_wstring(ProbeElapsedMs(item->start_tick, end)) +
-                        L" headers=" + (headers ? L"1" : L"0") + L" result=" + reason + L"}";
+                        L" headers=" + (headers ? L"1" : L"0") +
+                        L" http=" + (item->http_known ? std::to_wstring(item->http_status) : L"?") +
+                        L" result=" + reason + L"}";
                 }
                 if (requests.empty()) *trace += L"stage_empty error=" + std::to_wstring(fallback);
             }
@@ -783,8 +790,26 @@ private:
                 auto* probe = item->probe;
                 if (!probe) continue;
                 if (probe->headers.load(std::memory_order_acquire)) {
-                    const auto tick = probe->response_tick.load(std::memory_order_relaxed);
-                    if (!winner || tick < winner) winner = tick;
+                    if (!item->http_checked) {
+                        item->http_checked = true;
+                        item->step = L"QueryHeaders";
+                        DWORD size = sizeof(item->http_status);
+                        // Query once on the probe thread, never in the callback.
+                        item->http_known = WinHttpQueryHeaders(item->request,
+                            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                            WINHTTP_HEADER_NAME_BY_INDEX, &item->http_status, &size,
+                            WINHTTP_NO_HEADER_INDEX) != FALSE;
+                        if (!item->http_known) {
+                            item->http_error = GetLastError();
+                            if (!item->http_error) item->http_error = ERROR_WINHTTP_INVALID_SERVER_RESPONSE;
+                        } else if (!ProbeHttpStatusOk(item->http_status)) {
+                            item->http_error = ERROR_WINHTTP_INVALID_SERVER_RESPONSE;
+                        }
+                    }
+                    if (item->http_known && !item->http_error) {
+                        const auto tick = probe->response_tick.load(std::memory_order_relaxed);
+                        if (!winner || tick < winner) winner = tick;
+                    }
                 } else if (!probe->failed.load(std::memory_order_acquire)) {
                     pending = true;
                     // All WinHTTP API calls on this request stay on this thread.

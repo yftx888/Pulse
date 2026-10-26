@@ -1814,7 +1814,7 @@ void EnableDpiAwareness() {
     auto setContext = reinterpret_cast<SetContextFn>(GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetProcessDpiAwarenessContext"));
     if (setContext && setContext(reinterpret_cast<HANDLE>(static_cast<INT_PTR>(-4)))) return; // Per-Monitor V2.
     using SetAwarenessFn = HRESULT(WINAPI*)(int);
-    HMODULE shcore = LoadLibraryW(L"shcore.dll");
+    HMODULE shcore = LoadLibraryExW(L"shcore.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (shcore) {
         const auto setAwareness = reinterpret_cast<SetAwarenessFn>(GetProcAddress(shcore, "SetProcessDpiAwareness"));
         const bool success = setAwareness && SUCCEEDED(setAwareness(2));

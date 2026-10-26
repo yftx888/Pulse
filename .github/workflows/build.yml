@@ -45,6 +45,12 @@ jobs:
         shell: cmd
         run: call build.bat
 
+      - name: Run directed tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          & .\tests\run_ci_tests.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Upload MinGW executables
         uses: actions/upload-artifact@v7
         with:

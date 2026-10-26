@@ -41,6 +41,7 @@
 #include <psapi.h>
 #include <batclass.h>
 #include <wlanapi.h>
+#include <cfgmgr32.h>
 
 #include <algorithm>
 #include <array>
@@ -87,6 +88,8 @@ constexpr unsigned long long kGpuMemEveryMs = 3000;
 constexpr unsigned long long kGpuTempEveryMs = 2000;
 constexpr unsigned long long kGpuTempRetryMs = 30000;
 constexpr unsigned long long kGpuTempRediscoverMs = 60000;
+constexpr unsigned long long kDgpuRetryMs = 30000;
+constexpr unsigned long long kDgpuRediscoverMs = 60000;
 constexpr unsigned long long kWifiEveryMs = 10000;
 constexpr unsigned long long kBatteryHealthEveryMs = 600000;
 constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
@@ -112,6 +115,7 @@ constexpr unsigned kWantFps = 1u << 11;
 constexpr unsigned kWantScheme = 1u << 12;
 constexpr unsigned kWantCount = 1u << 13;
 constexpr unsigned kWantGpuTemp = 1u << 14;
+constexpr unsigned kWantDgpuPower = 1u << 15;
 constexpr unsigned kWantDefault = kWantChip | kWantGpu | kWantProc;
 
 static_assert(sizeof(void*) == 8, "x64 only");
@@ -224,6 +228,469 @@ void PulseKmtCloseAdapters(const PulseKmtApi& api, std::vector<PulseKmtAdapterIn
     }
     adapters.clear();
 }
+
+// CfgMgr ABI and property keys from the Windows SDK cfgmgr32.h/devpkey.h/winnt.h.
+// https://github.com/microsoft/win32metadata/tree/main/generation/WinSDK/RecompiledIdlHeaders
+constexpr DEVPROPKEY kPulseBusNumber = {
+    {0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}}, 23};
+constexpr DEVPROPKEY kPulseAddress = {
+    {0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}}, 30};
+constexpr DEVPROPKEY kPulsePowerData = {
+    {0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}}, 32};
+constexpr ULONG kPulseCmFilter = 0x00000200 | 0x00000100; // CLASS | PRESENT.
+#if defined(CM_GETIDLIST_FILTER_CLASS) && defined(CM_GETIDLIST_FILTER_PRESENT)
+static_assert(kPulseCmFilter == (CM_GETIDLIST_FILTER_CLASS | CM_GETIDLIST_FILTER_PRESENT), "CM list flags");
+#endif
+static_assert(DN_STARTED == 0x00000008, "DN_STARTED value");
+static_assert(PowerDeviceD0 == kDgpuPowerD0, "PowerDeviceD0 value");
+static_assert(sizeof(DEVICE_POWER_STATE) == 4 && sizeof(SYSTEM_POWER_STATE) == 4, "Power enum sizes");
+// All fields are 32 bits; no pointer-sized fields in CM_POWER_DATA.
+struct PulseCmPowerData {
+    DWORD PD_Size, PD_MostRecentPowerState, PD_Capabilities;
+    DWORD PD_D1Latency, PD_D2Latency, PD_D3Latency;
+    DWORD PD_PowerStateMapping[7], PD_DeepestSystemWake;
+};
+static_assert(sizeof(DEVPROPKEY) == 20 && offsetof(DEVPROPKEY, pid) == 16, "DEVPROPKEY layout");
+static_assert(sizeof(PulseCmPowerData) == 56, "CM_POWER_DATA size");
+static_assert(offsetof(PulseCmPowerData, PD_MostRecentPowerState) == 4, "CM power state offset");
+static_assert(offsetof(PulseCmPowerData, PD_PowerStateMapping) == 24, "CM power mapping offset");
+static_assert(offsetof(PulseCmPowerData, PD_DeepestSystemWake) == 52, "CM wake state offset");
+
+struct PulseCmApi {
+    HMODULE module = nullptr;
+    decltype(&CM_Get_Device_ID_List_SizeW) size = nullptr;
+    decltype(&CM_Get_Device_ID_ListW) list = nullptr;
+    decltype(&CM_Locate_DevNodeW) locate = nullptr;
+    decltype(&CM_Get_DevNode_Status) status = nullptr;
+    decltype(&CM_Get_DevNode_PropertyW) property = nullptr;
+    DWORD load_error = 0;
+    PulseCmApi() = default;
+    PulseCmApi(const PulseCmApi&) = delete;
+    PulseCmApi& operator=(const PulseCmApi&) = delete;
+    ~PulseCmApi() { Reset(); }
+    void Reset() {
+        if (module) FreeLibrary(module);
+        module = nullptr;
+        size = nullptr; list = nullptr; locate = nullptr; status = nullptr; property = nullptr;
+    }
+    bool Load() {
+        if (module) return true;
+        load_error = 0;
+        module = LoadLibraryExW(L"cfgmgr32.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (!module) { load_error = GetLastError(); return false; }
+        size = reinterpret_cast<decltype(size)>(GetProcAddress(module, "CM_Get_Device_ID_List_SizeW"));
+        list = reinterpret_cast<decltype(list)>(GetProcAddress(module, "CM_Get_Device_ID_ListW"));
+        locate = reinterpret_cast<decltype(locate)>(GetProcAddress(module, "CM_Locate_DevNodeW"));
+        status = reinterpret_cast<decltype(status)>(GetProcAddress(module, "CM_Get_DevNode_Status"));
+        property = reinterpret_cast<decltype(property)>(GetProcAddress(module, "CM_Get_DevNode_PropertyW"));
+        if (size && list && locate && status && property) return true;
+        load_error = ERROR_PROC_NOT_FOUND;
+        Reset();
+        return false;
+    }
+};
+struct PulseCmNode {
+    std::wstring id;
+    DEVINST devinst = 0;
+    ULONG flags = 0, problem = 0, bus = 0, address = 0;
+    CONFIGRET locate_rc = CR_CALL_NOT_IMPLEMENTED, status_rc = CR_CALL_NOT_IMPLEMENTED;
+    CONFIGRET bus_rc = CR_CALL_NOT_IMPLEMENTED, address_rc = CR_CALL_NOT_IMPLEMENTED;
+    CONFIGRET power_rc = CR_CALL_NOT_IMPLEMENTED;
+    bool eligible = false;
+};
+struct DgpuGate {
+    PulseCmApi api;
+    std::vector<PulseCmNode> nodes;
+    std::vector<DgpuAdapter> adapters;
+    bool ready = false;
+    unsigned long long retry_at = 0, enum_at = 0;
+    CONFIGRET enum_rc = CR_CALL_NOT_IMPLEMENTED;
+    void Reset() {
+        api.Reset();
+        std::vector<PulseCmNode>().swap(nodes);
+        std::vector<DgpuAdapter>().swap(adapters);
+        ready = false;
+        retry_at = enum_at = 0;
+        enum_rc = CR_CALL_NOT_IMPLEMENTED;
+    }
+    bool Fail(unsigned long long now) {
+        ready = false;
+        retry_at = now + kDgpuRetryMs;
+        return false;
+    }
+    CONFIGRET ReadUint(DEVINST devinst, const DEVPROPKEY& key, ULONG& value) {
+        DEVPROPTYPE type = 0;
+        ULONG bytes = sizeof(value);
+        const CONFIGRET rc = api.property(devinst, &key, &type, reinterpret_cast<PBYTE>(&value), &bytes, 0);
+        if (rc != CR_SUCCESS) return rc;
+        return type == DEVPROP_TYPE_UINT32 && bytes == sizeof(value) ? CR_SUCCESS : CR_INVALID_DATA;
+    }
+    bool Ensure(unsigned long long now) {
+        if (ready) return true;
+        if (now < retry_at) return false;
+        nodes.clear(); adapters.clear();
+        if (!api.Load()) { enum_rc = CR_CALL_NOT_IMPLEMENTED; return Fail(now); }
+        const wchar_t* display_class = L"{4d36e968-e325-11ce-bfc1-08002be10318}";
+        std::vector<wchar_t> ids;
+        // Device arrival can grow the MULTI_SZ between the two calls.
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            ULONG count = 0;
+            enum_rc = api.size(&count, display_class, kPulseCmFilter);
+            if (enum_rc != CR_SUCCESS) return Fail(now);
+            if (!count || count > (1u << 20)) { enum_rc = CR_INVALID_DATA; return Fail(now); }
+            ids.assign(count, L'\0');
+            enum_rc = api.list(display_class, ids.data(), count, kPulseCmFilter);
+            if (enum_rc == CR_SUCCESS) break;
+            if (enum_rc != CR_BUFFER_SMALL) return Fail(now);
+        }
+        if (enum_rc != CR_SUCCESS) return Fail(now);
+        bool failed = false;
+        for (std::size_t pos = 0; pos < ids.size() && ids[pos];) {
+            const wchar_t* end = std::wmemchr(ids.data() + pos, L'\0', ids.size() - pos);
+            if (!end) { enum_rc = CR_INVALID_DATA; return Fail(now); }
+            PulseCmNode node;
+            node.id.assign(ids.data() + pos, static_cast<std::size_t>(end - (ids.data() + pos)));
+            pos += node.id.size() + 1;
+            if (node.id.size() < 12 || _wcsnicmp(node.id.c_str(), L"PCI\\VEN_10DE", 12) != 0) continue;
+            node.locate_rc = api.locate(&node.devinst, node.id.data(), 0);
+            if (node.locate_rc == CR_SUCCESS)
+                node.status_rc = api.status(&node.flags, &node.problem, node.devinst, 0);
+            if (node.status_rc == CR_SUCCESS && (node.flags & DN_STARTED)) {
+                node.bus_rc = ReadUint(node.devinst, kPulseBusNumber, node.bus);
+                node.address_rc = ReadUint(node.devinst, kPulseAddress, node.address);
+                node.eligible = node.bus_rc == CR_SUCCESS && node.address_rc == CR_SUCCESS;
+                failed = failed || !node.eligible;
+            }
+            failed = failed || node.locate_rc != CR_SUCCESS || node.status_rc != CR_SUCCESS;
+            adapters.push_back({0x10DE, node.bus, node.address >> 16, 0, false});
+            nodes.push_back(std::move(node));
+        }
+        if (failed) return Fail(now);
+        ready = true;
+        enum_at = now;
+        retry_at = 0;
+        return true;
+    }
+    DgpuStatus Read(unsigned long long now) {
+        diagnostics::ScopedTiming timing(L"CfgMgr dGPU gate");
+        // Empty/disabled lists need discovery after a MUX or PnP change.
+        bool have_started = false;
+        for (const auto& node : nodes) have_started = have_started || node.eligible;
+        if (ready && !have_started && now - enum_at >= kDgpuRediscoverMs) ready = false;
+        if (!Ensure(now)) return DgpuStatus::ReadFailed;
+        bool failed = false;
+        for (std::size_t i = 0; i < nodes.size(); ++i) {
+            auto& node = nodes[i];
+            auto& adapter = adapters[i];
+            adapter.power_state = 0;
+            adapter.power_read_ok = false;
+            if (!node.eligible) continue;
+            PulseCmPowerData data{};
+            data.PD_Size = sizeof(data);
+            DEVPROPTYPE type = 0;
+            ULONG bytes = sizeof(data);
+            node.power_rc = api.property(node.devinst, &kPulsePowerData, &type,
+                reinterpret_cast<PBYTE>(&data), &bytes, 0);
+            if (node.power_rc == CR_SUCCESS && (type != DEVPROP_TYPE_BINARY || bytes != sizeof(data) ||
+                data.PD_Size != sizeof(data))) node.power_rc = CR_INVALID_DATA;
+            if (node.power_rc != CR_SUCCESS) { failed = true; continue; }
+            adapter.power_state = data.PD_MostRecentPowerState;
+            adapter.power_read_ok = true;
+        }
+        if (failed) { Fail(now); return DgpuStatus::ReadFailed; }
+        return DgpuGateStatus(adapters);
+    }
+};
+
+const wchar_t* DgpuPowerStateName(const DgpuAdapter& adapter) {
+    if (!adapter.power_read_ok) return L"unknown";
+    switch (adapter.power_state) {
+    case 1: return L"D0";
+    case 2: return L"D1";
+    case 3: return L"D2";
+    case 4: return L"D3";
+    default: return L"Unspecified";
+    }
+}
+std::wstring DgpuCrText(CONFIGRET rc) {
+    const wchar_t* name = L"CR_OTHER";
+    switch (rc) {
+    case CR_SUCCESS: name = L"CR_SUCCESS"; break;
+    case CR_NO_SUCH_DEVINST: name = L"CR_NO_SUCH_DEVINST"; break;
+    case CR_BUFFER_SMALL: name = L"CR_BUFFER_SMALL"; break;
+    case CR_INVALID_DATA: name = L"CR_INVALID_DATA"; break;
+    case CR_INVALID_DEVNODE: name = L"CR_INVALID_DEVNODE"; break;
+    case CR_NO_SUCH_VALUE: name = L"CR_NO_SUCH_VALUE"; break;
+    case CR_CALL_NOT_IMPLEMENTED: name = L"CR_CALL_NOT_IMPLEMENTED"; break;
+    case CR_DEVICE_NOT_THERE: name = L"CR_DEVICE_NOT_THERE"; break;
+    case CR_ACCESS_DENIED: name = L"CR_ACCESS_DENIED"; break;
+    }
+    wchar_t text[96]{};
+    std::swprintf(text, 96, L"%ls (0x%08lX)", name, static_cast<unsigned long>(rc));
+    return text;
+}
+std::wstring DgpuGateReport(const DgpuGate& gate, DgpuStatus status) {
+    std::wstring report = std::wstring(L"CfgMgr D-state gate: ") + DgpuStatusName(status) + L"\r\n";
+    report += L"  enumeration=" + DgpuCrText(gate.enum_rc) + L" load_error=" +
+        std::to_wstring(gate.api.load_error) + L"\r\n";
+    report += L"  CR_CALL_NOT_IMPLEMENTED also marks skipped calls; CR_INVALID_DATA includes invalid property type/size.\r\n";
+    for (std::size_t i = 0; i < gate.nodes.size(); ++i) {
+        const auto& node = gate.nodes[i];
+        const auto& adapter = gate.adapters[i];
+        report += L"  Instance ID: " + node.id + L"\r\n";
+        report += L"    locate=" + DgpuCrText(node.locate_rc) + L" status=" + DgpuCrText(node.status_rc) + L"\r\n";
+        report += std::wstring(L"    DN_STARTED=") + ((node.flags & DN_STARTED) ? L"yes" : L"no") +
+            L" flags=" + std::to_wstring(node.flags) + L" problem=" + std::to_wstring(node.problem) + L"\r\n";
+        report += L"    Bus=" + std::to_wstring(node.bus) + L" Device=" + std::to_wstring(node.address >> 16) +
+            L" Function=" + std::to_wstring(node.address & 0xffff) + L" Address=" + std::to_wstring(node.address) + L"\r\n";
+        report += L"    Bus_rc=" + DgpuCrText(node.bus_rc) + L" Address_rc=" + DgpuCrText(node.address_rc) + L"\r\n";
+        report += std::wstring(L"    PowerState=") + DgpuPowerStateName(adapter) + L" raw=" +
+            std::to_wstring(adapter.power_state) + L" PowerData_rc=" + DgpuCrText(node.power_rc) + L"\r\n";
+    }
+    return report;
+}
+
+// NVML ABI only; no NVIDIA headers, import library, or default DLL search path.
+// https://github.com/NVIDIA/go-nvml/blob/main/pkg/nvml/nvml.h (nvmlPciInfo_st)
+using nvmlReturn_t = int;
+struct nvmlDevice_st;
+using nvmlDevice_t = nvmlDevice_st*;
+struct nvmlPciInfo_t {
+    char busIdLegacy[16];
+    unsigned domain, bus, device, pciDeviceId, pciSubSystemId;
+    char busId[32];
+};
+static_assert(sizeof(nvmlPciInfo_t) == 68, "nvmlPciInfo_t size");
+static_assert(offsetof(nvmlPciInfo_t, domain) == 16, "NVML domain offset");
+static_assert(offsetof(nvmlPciInfo_t, bus) == 20, "NVML bus offset");
+static_assert(offsetof(nvmlPciInfo_t, device) == 24, "NVML device offset");
+static_assert(offsetof(nvmlPciInfo_t, pciDeviceId) == 28, "NVML pciDeviceId offset");
+static_assert(offsetof(nvmlPciInfo_t, pciSubSystemId) == 32, "NVML pciSubSystemId offset");
+static_assert(offsetof(nvmlPciInfo_t, busId) == 36, "NVML busId offset");
+constexpr nvmlReturn_t kNvmlSuccess = kDgpuNvmlSuccess;
+
+struct NvmlApi {
+    using InitFn = nvmlReturn_t(*)();
+    using ShutdownFn = nvmlReturn_t(*)();
+    using CountFn = nvmlReturn_t(*)(unsigned*);
+    using HandleFn = nvmlReturn_t(*)(unsigned, nvmlDevice_t*);
+    using PciFn = nvmlReturn_t(*)(nvmlDevice_t, nvmlPciInfo_t*);
+    using PowerFn = nvmlReturn_t(*)(nvmlDevice_t, unsigned*);
+    using NameFn = nvmlReturn_t(*)(nvmlDevice_t, char*, unsigned);
+    HMODULE module = nullptr;
+    InitFn init = nullptr;
+    ShutdownFn shutdown = nullptr;
+    CountFn count = nullptr;
+    HandleFn handle = nullptr;
+    PciFn pci = nullptr;
+    PowerFn power = nullptr;
+    PowerFn enforced_limit = nullptr;
+    NameFn name = nullptr;
+    bool initialized = false;
+    nvmlReturn_t init_result = -1;
+    DWORD load_error = 0;
+    std::wstring path;
+    NvmlApi() = default;
+    NvmlApi(const NvmlApi&) = delete;
+    NvmlApi& operator=(const NvmlApi&) = delete;
+    ~NvmlApi() { Reset(); }
+    void Reset() {
+        if (initialized && shutdown) shutdown();
+        initialized = false;
+        if (module) FreeLibrary(module);
+        module = nullptr;
+        init = nullptr; shutdown = nullptr; count = nullptr; handle = nullptr;
+        pci = nullptr; power = nullptr; enforced_limit = nullptr; name = nullptr;
+    }
+    bool Open() {
+        diagnostics::ScopedTiming timing(L"NVML init");
+        Reset();
+        path = L"System32\\nvml.dll";
+        init_result = -1;
+        load_error = 0;
+        module = LoadLibraryExW(L"nvml.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (!module) {
+            wchar_t root[32768]{};
+            const DWORD length = GetEnvironmentVariableW(L"ProgramW6432", root, 32768);
+            // Accept only an absolute drive path, never an expanded relative path.
+            if (length >= 3 && length < 32768 && root[1] == L':' && root[2] == L'\\') {
+                path = std::wstring(root) + L"\\NVIDIA Corporation\\NVSMI\\nvml.dll";
+                module = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+            }
+        }
+        if (!module) { load_error = GetLastError(); return false; }
+        wchar_t actual[32768]{};
+        const DWORD length = GetModuleFileNameW(module, actual, 32768);
+        if (length > 0 && length < 32768) path.assign(actual, length);
+        init = reinterpret_cast<InitFn>(GetProcAddress(module, "nvmlInit_v2"));
+        shutdown = reinterpret_cast<ShutdownFn>(GetProcAddress(module, "nvmlShutdown"));
+        count = reinterpret_cast<CountFn>(GetProcAddress(module, "nvmlDeviceGetCount_v2"));
+        handle = reinterpret_cast<HandleFn>(GetProcAddress(module, "nvmlDeviceGetHandleByIndex_v2"));
+        pci = reinterpret_cast<PciFn>(GetProcAddress(module, "nvmlDeviceGetPciInfo_v3"));
+        power = reinterpret_cast<PowerFn>(GetProcAddress(module, "nvmlDeviceGetPowerUsage"));
+        enforced_limit = reinterpret_cast<PowerFn>(GetProcAddress(module, "nvmlDeviceGetEnforcedPowerLimit"));
+        name = reinterpret_cast<NameFn>(GetProcAddress(module, "nvmlDeviceGetName"));
+        if (!init || !shutdown || !count || !handle || !pci || !power || !name) {
+            load_error = ERROR_PROC_NOT_FOUND;
+            Reset();
+            return false;
+        }
+        init_result = init();
+        initialized = init_result == kNvmlSuccess;
+        if (!initialized) { Reset(); return false; }
+        return true;
+    }
+};
+
+struct NvmlBoard {
+    nvmlDevice_t handle = nullptr;
+    nvmlPciInfo_t pci{};
+    unsigned limit_mw = 0;
+    bool limit_known = false;
+    bool selected = false;
+};
+
+struct DgpuPower {
+    DgpuGate gate;
+    NvmlApi nvml;
+    std::vector<NvmlBoard> boards;
+    std::vector<DgpuDevice> readings;
+    unsigned long long retry_at = 0;
+    DgpuStatus last_gate = DgpuStatus::Off;
+    DgpuHistory history;
+    bool glitch_logged = false;
+    unsigned long long glitch_log_at = 0;
+    DgpuStatus logged_status = DgpuStatus::Off;
+    std::size_t logged_matched = static_cast<std::size_t>(-1);
+    std::wstring logged_init;
+    std::wstring logged_devices;
+    DgpuStatus retry_status = DgpuStatus::NvmlUnavailable;
+    void CloseNvml() {
+        nvml.Reset();
+        boards.clear();
+        readings.clear();
+        history.Reset();
+    }
+    void Reset() {
+        CloseNvml();
+        std::vector<NvmlBoard>().swap(boards);
+        std::vector<DgpuDevice>().swap(readings);
+        gate.Reset();
+        retry_at = 0;
+        last_gate = DgpuStatus::Off;
+        glitch_logged = false;
+        glitch_log_at = 0;
+        logged_status = DgpuStatus::Off;
+        logged_matched = static_cast<std::size_t>(-1);
+        logged_init.clear();
+        logged_devices.clear();
+    }
+    DgpuResult Publish(DgpuResult result) {
+        // Sleep transitions have their own gate log; glitches use the rate-limited raw log.
+        if (result.status != DgpuStatus::Sleeping && result.status != DgpuStatus::Valid &&
+            result.status != DgpuStatus::Glitch &&
+            (result.status != logged_status || result.matched != logged_matched)) {
+            diagnostics::WriteLog(L"GPU", std::wstring(L"dGPU status=") + DgpuStatusName(result.status) +
+                L" matched=" + std::to_wstring(result.matched));
+        }
+        logged_status = result.status;
+        logged_matched = result.matched;
+        return result;
+    }
+    bool Enumerate() {
+        boards.clear();
+        unsigned count = 0;
+        const nvmlReturn_t count_rc = nvml.count(&count);
+        bool ok = count_rc == kNvmlSuccess && count <= 4096;
+        std::wstring message = L"NVML devices=" + std::to_wstring(count) + L" count_rc=" + std::to_wstring(count_rc);
+        if (ok) {
+            for (unsigned i = 0; i < count; ++i) {
+                NvmlBoard board;
+                const nvmlReturn_t handle_rc = nvml.handle(i, &board.handle);
+                const nvmlReturn_t pci_rc = handle_rc == kNvmlSuccess && board.handle ?
+                    nvml.pci(board.handle, &board.pci) : -1;
+                message += L" [" + std::to_wstring(i) + L" handle_rc=" + std::to_wstring(handle_rc) +
+                    L" pci_rc=" + std::to_wstring(pci_rc) + L" bus=" + std::to_wstring(board.pci.bus) +
+                    L" device=" + std::to_wstring(board.pci.device) + L"]";
+                if (handle_rc != kNvmlSuccess || pci_rc != kNvmlSuccess) { ok = false; continue; }
+                // CfgMgr exposes bus/device without a PCI domain; require domain 0.
+                if (board.pci.domain == 0) {
+                    if (DgpuMatches(gate.adapters, board.pci.bus, board.pci.device) && nvml.enforced_limit) {
+                        unsigned limit = 0;
+                        if (nvml.enforced_limit(board.handle, &limit) == kNvmlSuccess) {
+                            board.limit_mw = limit;
+                            board.limit_known = true;
+                        }
+                    }
+                    boards.push_back(board);
+                }
+            }
+        }
+        if (message != logged_devices) { diagnostics::WriteLog(L"GPU", message); logged_devices = message; }
+        return ok;
+    }
+    DgpuResult Read(unsigned long long now) {
+        const DgpuStatus status = gate.Read(now);
+        if (status == DgpuStatus::Sleeping && last_gate != DgpuStatus::Sleeping)
+            diagnostics::WriteLog(L"GPU", L"dGPU asleep: NVML idle, no calls");
+        else if (status == DgpuStatus::Valid && last_gate != DgpuStatus::Valid)
+            diagnostics::WriteLog(L"GPU", L"dGPU awake");
+        last_gate = status;
+        const auto action = DgpuNextAction(status == DgpuStatus::Valid, nvml.initialized, now, retry_at);
+        if (status != DgpuStatus::Valid) {
+            // Sleeping keeps the session untouched, including nvmlShutdown.
+            // Missing/failed PnP devices invalidate the session on this exceptional path.
+            if (status != DgpuStatus::Sleeping) CloseNvml();
+            return Publish({status, NAN, 0});
+        }
+        if (action == DgpuAction::None) return Publish({retry_status, NAN, 0});
+        if (action == DgpuAction::Init) {
+            retry_at = now + kDgpuRetryMs;
+            const bool opened = nvml.Open();
+            const std::wstring message = L"NVML path=" + nvml.path + L" init_rc=" +
+                std::to_wstring(nvml.init_result) + L" load_error=" + std::to_wstring(nvml.load_error);
+            if (message != logged_init) { diagnostics::WriteLog(L"GPU", message); logged_init = message; }
+            if (!opened) {
+                retry_status = DgpuStatus::NvmlUnavailable;
+                return Publish({retry_status, NAN, 0});
+            }
+            if (!Enumerate()) {
+                CloseNvml();
+                retry_status = DgpuStatus::ReadFailed;
+                return Publish({retry_status, NAN, 0});
+            }
+        }
+        readings.clear();
+        {
+            diagnostics::ScopedTiming timing(L"NVML power");
+            for (auto& board : boards) {
+                const bool selected = DgpuMatches(gate.adapters, board.pci.bus, board.pci.device);
+                if (selected != board.selected) history.Reset();
+                board.selected = selected;
+                if (!selected) continue;
+                unsigned mw = 0;
+                const nvmlReturn_t rc = nvml.power(board.handle, &mw);
+                readings.push_back({board.pci.bus, board.pci.device, rc, mw, board.limit_mw, board.limit_known});
+                if (rc == kNvmlSuccess && DgpuPowerGlitch(mw, board.limit_mw, board.limit_known) &&
+                    (!glitch_logged || now - glitch_log_at >= 60000)) {
+                    diagnostics::WriteLog(L"GPU", L"dGPU power glitch: raw_mW=" + std::to_wstring(mw) +
+                        L" limit_mW=" + std::to_wstring(board.limit_mw) +
+                        L" limit_known=" + (board.limit_known ? L"yes" : L"no"));
+                    glitch_logged = true;
+                    glitch_log_at = now;
+                }
+            }
+        }
+        const DgpuResult result = history.Apply(InterpretDgpu(gate.adapters, readings), now);
+        if (result.status == DgpuStatus::ReadFailed || result.status == DgpuStatus::NoMatch) {
+            // A driver reset/hotplug may invalidate cached handles or PCI identities.
+            CloseNvml();
+            retry_at = now + kDgpuRetryMs;
+            retry_status = result.status;
+        }
+        return Publish(result);
+    }
+};
 
 struct BatteryReading {
     bool present = false;
@@ -804,6 +1271,7 @@ constexpr unsigned PackWants(const Wants& w) {
     if (w.power_scheme) bits |= kWantScheme;
     if (w.process_count) bits |= kWantCount;
     if (w.gpu_temp) bits |= kWantGpuTemp;
+    if (w.dgpu_power) bits |= kWantDgpuPower;
     return bits;
 }
 
@@ -824,6 +1292,7 @@ constexpr Wants UnpackWants(unsigned bits) {
     w.power_scheme = (bits & kWantScheme) != 0;
     w.process_count = (bits & kWantCount) != 0;
     w.gpu_temp = (bits & kWantGpuTemp) != 0;
+    w.dgpu_power = (bits & kWantDgpuPower) != 0;
     return w;
 }
 
@@ -843,6 +1312,10 @@ static_assert(!UnpackWants(kWantDefault).fps, "default fps off");
 static_assert(UnpackWants(kWantGpuTemp).gpu_temp, "unpack gpu temperature");
 static_assert(PackWants(UnpackWants(kWantGpuTemp)) == kWantGpuTemp, "gpu temperature want bit");
 static_assert(!UnpackWants(kWantDefault).gpu_temp, "default gpu temperature off");
+
+static_assert(UnpackWants(kWantDgpuPower).dgpu_power, "unpack dgpu power");
+static_assert(PackWants(UnpackWants(kWantDgpuPower)) == kWantDgpuPower, "dgpu power want bit");
+static_assert(!UnpackWants(kWantDefault).dgpu_power, "default dgpu power off");
 
 using WlanOpenHandleFn = DWORD(WINAPI*)(DWORD, PVOID, PDWORD, PHANDLE);
 using WlanCloseHandleFn = DWORD(WINAPI*)(HANDLE, PVOID);
@@ -1376,6 +1849,8 @@ struct Metrics::Impl {
     double gpu_shared_mb_ = NAN;
     double gpu_dedicated_mb_ = NAN;
 
+    DgpuPower dgpu_;
+
     PulseKmtApi gpu_temp_api_;
     std::vector<PulseKmtAdapterInfo> gpu_temp_adapters_;
     bool gpu_temp_ready_ = false, have_gpu_temp_due_ = false;
@@ -1475,7 +1950,7 @@ void Metrics::Impl::LoadPowerApi() {
     if (power_api_tried_) return;
     power_api_tried_ = true;
     HMODULE mod = GetModuleHandleW(L"powrprof.dll");
-    if (!mod) mod = LoadLibraryW(L"powrprof.dll");
+    if (!mod) mod = LoadLibraryExW(L"powrprof.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!mod) return;
     overlay_fn_ = reinterpret_cast<OverlayFn>(GetProcAddress(mod, "PowerGetEffectiveOverlayScheme"));
     active_fn_ = reinterpret_cast<ActiveSchemeFn>(GetProcAddress(mod, "PowerGetActiveScheme"));
@@ -2082,6 +2557,7 @@ void Metrics::Impl::CloseQueries() {
     ReleaseCpuQuery();
     ReleaseGpuMem();
     ReleaseGpuTemp();
+    dgpu_.Reset();
     ReleaseWifi();
     ReleaseProcs();
     ReleaseSysDisk();
@@ -2131,6 +2607,11 @@ void Metrics::Impl::ClearTurnedOff(Snapshot& s, const Wants& w) {
     if (!w.cpu_freq) s.cpu_mhz = NAN;
     if (!w.uptime) s.uptime_s = NAN;
     if (!w.gpu_temp) s.gpu_temp_c = NAN;
+    if (!w.dgpu_power) {
+        s.dgpu_status = DgpuStatus::Off;
+        s.dgpu_w = NAN;
+        dgpu_.Reset();
+    }
     if (!w.gpu_memory) {
         s.gpu_shared_mem_mb = NAN;
         s.gpu_dedicated_mem_mb = NAN;
@@ -2416,7 +2897,7 @@ bool Metrics::Impl::EnsureWifi(unsigned long long now) {
     wifi_tried_ = true;
     wifi_retry_at_ = now + kPdhRetryMs;
     if (!wifi_mod_) {
-        wifi_mod_ = LoadLibraryW(L"wlanapi.dll");
+        wifi_mod_ = LoadLibraryExW(L"wlanapi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
         if (!wifi_mod_) return false;
         wifi_open_ = reinterpret_cast<WlanOpenHandleFn>(GetProcAddress(wifi_mod_, "WlanOpenHandle"));
         wifi_close_ = reinterpret_cast<WlanCloseHandleFn>(GetProcAddress(wifi_mod_, "WlanCloseHandle"));
@@ -2927,7 +3408,7 @@ void Metrics::Impl::UpdateProcs(Snapshot& s, unsigned long long now) {
 
 Snapshot Metrics::Impl::Take(bool full) {
     Wants wants = CurrentWants();
-    if (!full) { wants.processes = false; wants.power_scheme = false; }
+    if (!full) { wants.processes = false; wants.power_scheme = false; wants.dgpu_power = false; }
     if (!wants.chip_power) ReleaseEnergy();
     if (!wants.gpu_usage) ReleaseGpu();
     if (!wants.processes) ReleaseProcs();
@@ -2935,6 +3416,8 @@ Snapshot Metrics::Impl::Take(bool full) {
     if (!wants.cpu_freq) ReleaseCpuFreq();
     if (!wants.gpu_memory) ReleaseGpuMem();
     if (!wants.gpu_temp) ReleaseGpuTemp();
+    if (!wants.dgpu_power && (dgpu_.gate.api.module || dgpu_.gate.retry_at || dgpu_.last_gate != DgpuStatus::Off ||
+        dgpu_.logged_status != DgpuStatus::Off)) dgpu_.Reset();
     if (!wants.wifi) ReleaseWifi();
     if (!wants.sys_disk) ReleaseSysDisk();
     if (!wants.battery_health) ReleaseBatteryHealth();
@@ -2959,6 +3442,9 @@ Snapshot Metrics::Impl::Take(bool full) {
     if (paused_.load(std::memory_order_relaxed)) {
         // A hidden widget must not keep a system-wide Present consumer.
         ReleaseFps(L"paused");
+        dgpu_.Reset();
+        last_.dgpu_status = DgpuStatus::Off;
+        last_.dgpu_w = NAN;
         ClearTurnedOff(last_, wants);
         last_.fps = NAN;
         last_.fps_status = 0;
@@ -3037,6 +3523,11 @@ Snapshot Metrics::Impl::Take(bool full) {
     if (wants.uptime) UpdateUptime(s);
     if (wants.gpu_memory) UpdateGpuMemory(now, s);
     if (wants.gpu_temp) UpdateGpuTemp(now, s);
+    if (full && wants.dgpu_power) {
+        const auto result = dgpu_.Read(now);
+        s.dgpu_status = result.status;
+        s.dgpu_w = result.watts;
+    }
     if (wants.wifi) UpdateWifi(now, s);
     if (wants.battery_health) UpdateBatteryHealth(now, s);
     if (wants.fps) UpdateFps(s, now);
@@ -3080,6 +3571,7 @@ void Metrics::SetSlowThreshold(int slow_ms) { impl_->probe.SetSlowThreshold(slow
 void Metrics::OnSuspend() { impl_->probe.OnSuspend(); }
 
 void Metrics::OnResume() {
+    impl_->dgpu_.Reset();
     impl_->reset_intervals_.store(true, std::memory_order_release);
     impl_->probe.OnResume();
 }
@@ -3105,7 +3597,7 @@ std::wstring DiagVersion() {
     wchar_t path[1024]{};
     const DWORD length = GetModuleFileNameW(nullptr, path, 1024);
     if (!length || length >= 1024) return L"unknown";
-    HMODULE library = LoadLibraryW(L"version.dll");
+    HMODULE library = LoadLibraryExW(L"version.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!library) return L"unknown";
     using SizeFn = DWORD(WINAPI*)(LPCWSTR, LPDWORD);
     using ReadFn = BOOL(WINAPI*)(LPCWSTR, DWORD, DWORD, LPVOID);
@@ -3192,6 +3684,86 @@ bool CollectRaw(PDH_HCOUNTER counter, std::vector<DiagRaw>& out, long& array_sta
 
 }  // namespace
 
+std::wstring BuildDgpuGateDiagnosticsReport() {
+    DgpuGate gate;
+    const auto status = gate.Read(GetTickCount64());
+    return DgpuGateReport(gate, status); // CfgMgr only; never loads NVML.
+}
+
+std::wstring BuildDgpuDiagnosticsReport(bool allow_wake, void (*before_nvml)(const std::wstring&)) {
+    std::wstring report;
+    auto line = [&](const std::wstring& text) { report += text; report += L"\r\n"; };
+    DgpuGate gate;
+    const DgpuStatus status = gate.Read(GetTickCount64());
+    line(L"[NVIDIA dGPU]");
+    report += DgpuGateReport(gate, status);
+    line(L"Only system-reported D0 opens the normal NVML gate; temperature is not used.");
+    if (status != DgpuStatus::Valid && !allow_wake) {
+        if (status == DgpuStatus::Sleeping) line(L"asleep; NVML not called to avoid waking it");
+        else if (status == DgpuStatus::NoNvidia) line(L"No NVIDIA display adapter; NVML not called to avoid waking it");
+        else line(L"CfgMgr gate failed or unknown; NVML not called to avoid waking it");
+        return report;
+    }
+    if (status != DgpuStatus::Valid)
+        line(L"WARNING: dGPU looks asleep; NVML may wake it.");
+    if (before_nvml) { before_nvml(report); report.clear(); }
+    NvmlApi nvml;
+    const bool opened = nvml.Open();
+    line(L"NVML path: " + nvml.path);
+    line(L"NVML load_error=" + std::to_wstring(nvml.load_error));
+    line(L"nvmlInit_v2: " + std::to_wstring(nvml.init_result) +
+        (nvml.init_result == -1 ? L" (not called)" : L""));
+    if (!opened) { line(L"Result: NvmlUnavailable"); return report; }
+    unsigned count = 0;
+    const nvmlReturn_t count_rc = nvml.count(&count);
+    line(L"nvmlDeviceGetCount_v2: " + std::to_wstring(count_rc) + L" devices=" + std::to_wstring(count));
+    if (count_rc != kNvmlSuccess || count > 4096) { line(L"Result: ReadFailed"); return report; }
+    std::vector<DgpuDevice> readings;
+    bool failed = false;
+    for (unsigned i = 0; i < count; ++i) {
+        nvmlDevice_t handle = nullptr;
+        const nvmlReturn_t handle_rc = nvml.handle(i, &handle);
+        line(L"  device=" + std::to_wstring(i) + L" handle_rc=" + std::to_wstring(handle_rc));
+        if (handle_rc != kNvmlSuccess || !handle) { failed = true; continue; }
+        nvmlPciInfo_t pci{};
+        const nvmlReturn_t pci_rc = nvml.pci(handle, &pci);
+        char name[128]{};
+        const nvmlReturn_t name_rc = nvml.name(handle, name, static_cast<unsigned>(sizeof(name)));
+        name[sizeof(name) - 1] = '\0';
+        wchar_t wide_name[128]{};
+        MultiByteToWideChar(CP_UTF8, 0, name, -1, wide_name, 128);
+        line(L"    name_rc=" + std::to_wstring(name_rc) + L" name=" + wide_name);
+        wchar_t text[256]{};
+        std::swprintf(text, 256, L"    pci_rc=%d PCI=%u:%u:%u (domain:bus:device)", pci_rc,
+            pci.domain, pci.bus, pci.device);
+        line(text);
+        if (pci_rc != kNvmlSuccess) { failed = true; if (!allow_wake) continue; }
+        const bool matched = pci_rc == kNvmlSuccess && pci.domain == 0 &&
+            DgpuMatches(gate.adapters, pci.bus, pci.device);
+        line(std::wstring(L"    awake_match=") + (matched ? L"yes" : L"no"));
+        if (!allow_wake && !matched) { line(L"    PowerUsage skipped: adapter is not an awake match"); continue; }
+        unsigned limit_mw = 0;
+        const nvmlReturn_t limit_rc = nvml.enforced_limit ? nvml.enforced_limit(handle, &limit_mw) : -1;
+        line(L"    nvmlDeviceGetEnforcedPowerLimit: " + std::to_wstring(limit_rc) +
+            L" mW=" + std::to_wstring(limit_mw));
+        if (limit_rc != kNvmlSuccess) limit_mw = 0;
+        unsigned mw = 0;
+        nvmlReturn_t power_rc;
+        {
+            diagnostics::ScopedTiming timing(L"NVML power");
+            power_rc = nvml.power(handle, &mw);
+        }
+        line(L"    nvmlDeviceGetPowerUsage: " + std::to_wstring(power_rc) + L" mW=" + std::to_wstring(mw));
+        if (matched) readings.push_back({pci.bus, pci.device, power_rc, mw, limit_mw, limit_rc == kNvmlSuccess});
+    }
+    const DgpuResult result = InterpretDgpu(gate.adapters, readings);
+    line(std::wstring(L"Result: ") + (failed ? L"ReadFailed" : DgpuStatusName(result.status)) +
+        L" awake_matched=" + std::to_wstring(result.matched));
+    if (!failed && result.status == DgpuStatus::Valid) line(L"dGPU watts: " + std::to_wstring(result.watts));
+    line(L"nvmlShutdown + FreeLibrary on exit");
+    return report;
+}
+
 std::wstring BuildPowerDiagnosticsReport() {
     std::wstring report;
     auto line = [&](const std::wstring& text) { report += text; report += L"\r\n"; };
@@ -3212,12 +3784,12 @@ std::wstring BuildPowerDiagnosticsReport() {
     line(L"D3DKMT_ADAPTER_PERFDATA.Power is 0.1 percent, not watts, and is not used as a fallback.");
     line(L"D3DKMT_ADAPTER_PERFDATA.FanRPM is the adapter fan, not a general CPU fan, and is not read here.");
     line(L"Domains: package=package0_pkg, cpu=pp0, graphics=pp1, memory=dram. pp1 is an EMI graphics domain, not discrete-GPU board power.");
-    line(L"GPU Engine utilization can come from a different adapter than pp1. This build does not call NVML or ADLX.");
+    line(L"GPU Engine utilization can come from a different adapter than pp1. NVIDIA board power uses NVML only after a system-reported D0 CfgMgr gate; ADLX is not used.");
     line(L"");
 
     HMODULE powerLib = GetModuleHandleW(L"powrprof.dll");
     const bool loadedPower = powerLib == nullptr;
-    if (!powerLib) powerLib = LoadLibraryW(L"powrprof.dll");
+    if (!powerLib) powerLib = LoadLibraryExW(L"powrprof.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     const auto activeFn = powerLib ? reinterpret_cast<ActiveSchemeFn>(GetProcAddress(powerLib, "PowerGetActiveScheme")) : nullptr;
     const auto friendlyFn = powerLib ? reinterpret_cast<FriendlyNameFn>(GetProcAddress(powerLib, "PowerReadFriendlyName")) : nullptr;
     const auto overlayFn = powerLib ? reinterpret_cast<OverlayFn>(GetProcAddress(powerLib, "PowerGetEffectiveOverlayScheme")) : nullptr;
@@ -3279,6 +3851,8 @@ std::wstring BuildPowerDiagnosticsReport() {
     }
     line(L"");
 
+    report += BuildDgpuDiagnosticsReport(false);
+    line(L"");
     line(L"[Energy Meter]");
     PDH_HQUERY query = nullptr;
     const PDH_STATUS openStatus = PdhOpenQueryW(nullptr, 0, &query);

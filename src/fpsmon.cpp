@@ -199,7 +199,7 @@ void Prepare(TraceBuffer& buf, const wchar_t* name, bool sized) {
 
 EnableTraceEx2Fn LoadEnableTraceEx2() {
     HMODULE module = GetModuleHandleW(L"advapi32.dll");
-    if (!module) module = LoadLibraryW(L"advapi32.dll");
+    if (!module) module = LoadLibraryExW(L"advapi32.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!module) return nullptr;
     return reinterpret_cast<EnableTraceEx2Fn>(GetProcAddress(module, "EnableTraceEx2"));
 }

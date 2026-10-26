@@ -44,6 +44,12 @@ jobs:
         shell: cmd
         run: call build.bat
 
+      - name: Run directed tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          & .\tests\run_ci_tests.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Validate tag against app.rc
         id: version
         shell: pwsh

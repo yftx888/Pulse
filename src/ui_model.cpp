@@ -120,6 +120,7 @@ Wants CollectionWants(const Components& components, DisplayMode display, bool de
     w.chip_power = compact ? c.Enabled(CompactComponent::Power) && package :
         c.Enabled(FullComponent::Hardware) || (c.Enabled(FullComponent::PowerChart) && package);
     w.gpu_usage = compact ? c.Enabled(CompactComponent::Gpu) : c.Enabled(FullComponent::Hardware);
+    w.dgpu_power = display == DisplayMode::Full && c.Enabled(FullComponent::Hardware);
     w.processes = !compact && c.Enabled(FullComponent::Processes);
     w.process_count = !compact && c.Enabled(FullComponent::SystemInfo);
     w.power_scheme = !compact && c.Enabled(FullComponent::Battery);
@@ -232,7 +233,7 @@ std::wstring CompactSpeed(double bps) {
 std::wstring MeterText(MeterStatus status, double watts) {
     if (status == MeterStatus::Valid && std::isfinite(watts) && watts >= 0.0 && watts < 1.0e6) {
         const auto number = Number(watts, watts >= 100 ? 0 : 1);
-        // The card's scope note identifies this as EMI graphics-domain power.
+        // EMI graphics-domain power remains the fallback for unavailable NVML.
         return number + T(Key::WattSuffix);
     }
     switch (status) {
@@ -373,7 +374,11 @@ bool Model::Update(const Snapshot& s, bool compact, const Components& c, bool ta
             v.packageW = packageKnown ? Number(s.pkg_w, s.pkg_w >= 100 ? 0 : 1) : L"--";
             v.packageNote = packageKnown ? T(Key::WholeChip) : MeterText(s.pkg_meter, NAN);
             v.cpuW = MeterText(s.cpu_meter, s.cpu_w);
-            v.gpuW = MeterText(s.gpu_meter, s.gpu_w);
+            v.gpuW = s.dgpu_status == DgpuStatus::Valid && PositivePower(s.dgpu_w)
+                ? T(Key::DgpuPrefix) + Number(s.dgpu_w, s.dgpu_w >= 10 ? 0 : 1) + T(Key::WattSuffix)
+                : s.dgpu_status == DgpuStatus::Sleeping ? T(Key::DgpuSleeping)
+                : s.dgpu_status == DgpuStatus::Glitch ? T(Key::DgpuPrefix) + L"--"
+                : MeterText(s.gpu_meter, s.gpu_w);
             v.memW = MeterText(s.mem_meter, s.mem_w);
         }
         if (battery) {

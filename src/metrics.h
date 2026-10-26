@@ -3,6 +3,7 @@
 // 约定：数值未知时用 NaN（double）或 -1（整数），界面显示 "--"。
 #pragma once
 #include "power_state.h"
+#include "dgpu_state.h"
 #include <cmath>
 #include <cstdint>
 #include <string>
@@ -118,6 +119,9 @@ struct Snapshot {
     MeterStatus mem_meter = MeterStatus::Off;
 
     bool active_plan_balanced = false; // Confirmed system Balanced plan GUID, not its display name.
+
+    DgpuStatus dgpu_status = DgpuStatus::Off;
+    double dgpu_w = NAN; // Valid only when dgpu_status is Valid.
 };
 
 // 网络探测事件（断网 / 恢复），由后端在探测线程里回调；界面负责弹提醒卡片、播放提示音。
@@ -157,6 +161,7 @@ struct Wants {
     bool power_scheme = false;    // Only the full battery card displays this.
     bool process_count = false;   // Cheap count, independent of the top-three scan.
     bool gpu_temp = false;
+    bool dgpu_power = false; // Full hardware card only; D0-gated NVML.
 };
 
 class Metrics {
@@ -191,6 +196,15 @@ private:
     struct Impl;
     Impl* impl_;
 };
+
+// Manual NVIDIA report. allow_wake is reserved for metrics_selftest --nvml.
+// CfgMgr-only display-device diagnostic; never calls or loads NVML.
+std::wstring BuildDgpuGateDiagnosticsReport();
+
+// Normal diagnostics never call NVML unless the system reports D0.
+// Optional sink flushes gate/warning text before a manual NVML call.
+std::wstring BuildDgpuDiagnosticsReport(bool allow_wake = false,
+    void (*before_nvml)(const std::wstring&) = nullptr);
 
 // Manual power diagnostic shared by metrics_selftest --power and Pulse.exe --power-diagnostics.
 // It does not start network probes, the UI sampler, settings writes, or a resident thread.

@@ -90,7 +90,7 @@ UINT WindowDpi(HWND window) {
 }
 UINT MonitorDpi(HMONITOR monitor) {
     using GetDpiFn = HRESULT(WINAPI*)(HMONITOR, int, UINT*, UINT*);
-    const HMODULE shcore = LoadLibraryW(L"shcore.dll");
+    const HMODULE shcore = LoadLibraryExW(L"shcore.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     UINT x = 96, y = 96;
     if (shcore) {
         const auto getDpi = reinterpret_cast<GetDpiFn>(GetProcAddress(shcore, "GetDpiForMonitor"));
@@ -769,6 +769,11 @@ void Renderer::UpdateFullLayout() {
         hardware = std::max(hardware, std::max(Measure(T(key), 10.5f),
             Measure(T(key), 10.5f, false, true)) + 2);
     hardware = std::max(hardware, Measure(L"999.9" + T(Key::WattSuffix), 10.5f) + 2);
+    for (const auto& text : {T(Key::DgpuPrefix) + L"9.9" + T(Key::WattSuffix),
+                             T(Key::DgpuPrefix) + L"999" + T(Key::WattSuffix), T(Key::DgpuSleeping),
+                             T(Key::DgpuPrefix) + L"--"})
+        hardware = std::max(hardware, std::max(Measure(text, 10.5f),
+            Measure(text, 10.5f, false, true)) + 2);
     fullWidth_ = std::max(fullWidth_, 50 + hardware * 4 + 30);
     fullWidth_ = std::max(fullWidth_, 50 + systemLabelWidth_ + Measure(L"999.9 / 999.9" + T(Key::GbSuffix), 12));
     for (Key key : {Key::FullyCharged, Key::AcPower, Key::NoBatteryDetected, Key::Calculating, Key::Reading,

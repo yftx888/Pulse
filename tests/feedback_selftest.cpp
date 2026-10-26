@@ -11,6 +11,7 @@
 #endif
 #include "ui_model.h"
 #include "power_diagnostics.h"
+#include "probe_status.h"
 
 #include <windows.h>
 
@@ -89,6 +90,16 @@ pulse::BatterySample Sample() {
     in.read_ok = true;
     in.present = true;
     return in;
+}
+
+void CheckProbeHttpStatus() {
+    for (const unsigned long code : {200ul, 201ul, 204ul, 206ul, 299ul})
+        Expect(pulse::ProbeHttpStatusOk(code), "HTTP 2xx status succeeds");
+    for (const unsigned long code : {0ul, 100ul, 199ul, 300ul, 301ul, 302ul, 307ul,
+                                     400ul, 401ul, 403ul, 407ul, 500ul, 502ul, 503ul})
+        Expect(!pulse::ProbeHttpStatusOk(code), "HTTP redirect or error status fails");
+    Expect(!pulse::ProbeHttpStatusOk(std::numeric_limits<unsigned long>::max()),
+           "HTTP status rejects maximum unsigned long");
 }
 
 void CheckClassifier() {
@@ -868,9 +879,138 @@ void CheckCollectionTrace() {
            "confirmed pure battery releases package power");
 }
 
+void CheckDgpu() {
+    using namespace pulse;
+    const DgpuAdapter awake{0x10DE, 1, 0, 1};
+    const DgpuAdapter asleep{0x10DE, 2, 0, 4};
+    Expect(static_cast<int>(DgpuStatus::Valid) == 7 && static_cast<int>(DgpuStatus::Glitch) == 8,
+           "dGPU appends Glitch without changing existing enum values");
+    ExpectEq(DgpuStatusName(DgpuStatus::Glitch), L"Glitch", "dGPU glitch diagnostic name");
+    Expect(DgpuGateStatus({}) == DgpuStatus::NoNvidia, "dGPU empty enumeration");
+    Expect(InterpretDgpu({{0x8086, 0, 2, 1}}, {}).status == DgpuStatus::NoNvidia, "dGPU Intel only");
+    Expect(DgpuAwake(awake), "dGPU D0 is awake");
+    for (const unsigned state : {0u, 2u, 3u, 4u, 5u, 1500u}) {
+        const DgpuAdapter adapter{0x10DE, 1, 0, state};
+        Expect(!DgpuAwake(adapter), "dGPU non-D0 is never awake");
+        Expect(InterpretDgpu({adapter}, {}).status == DgpuStatus::Sleeping, "dGPU non-D0 sleeps");
+    }
+    Expect(!DgpuAwake({0x10DE, 1, 0, 1, false}), "dGPU failed D0 property read closes gate");
+    Expect(DgpuGateStatus({{0x10DE, 1, 0, 1, false}}) == DgpuStatus::Sleeping,
+           "dGPU failed power read is not awake");
+    for (const bool open : {false, true}) {
+        for (const auto now : {0ull, 29999ull, 30000ull, 60000ull}) {
+            for (const auto retry : {0ull, 30000ull, 90000ull})
+                Expect(DgpuNextAction(false, open, now, retry) == DgpuAction::None,
+                       "sleep never initializes, reads, or shuts down NVML");
+        }
+    }
+    Expect(DgpuNextAction(true, false, 1000, 0) == DgpuAction::Init, "awake opens first NVML session");
+    Expect(DgpuNextAction(true, false, 29999, 30000) == DgpuAction::None, "NVML init failure keeps retry delay");
+    Expect(DgpuNextAction(true, false, 30000, 30000) == DgpuAction::Init, "NVML retries at 30 second boundary");
+    Expect(DgpuNextAction(true, true, 1000, 30000) == DgpuAction::Read, "awake reuses NVML session");
+    bool session = false;
+    unsigned inits = 0, reads = 0;
+    for (const bool gate : {false, true, true, false, false, true}) {
+        const auto action = DgpuNextAction(gate, session, 0, 0);
+        if (action == DgpuAction::Init) { ++inits; session = true; }
+        else if (action == DgpuAction::Read) ++reads;
+    }
+    Expect(session && inits == 1 && reads == 2, "D0 D3 D0 cycle keeps session and has no asleep calls");
+
+    auto result = InterpretDgpu({awake}, {{1, 0, 0, 45000}});
+    Expect(result.status == DgpuStatus::Valid && result.watts == 45.0 && result.matched == 1, "dGPU mW to W and PCI match");
+    Expect(InterpretDgpu({awake}, {{2, 0, 0, 45000}}).status == DgpuStatus::NoMatch, "dGPU bus mismatch");
+    Expect(InterpretDgpu({awake}, {{1, 1, 0, 45000}}).status == DgpuStatus::NoMatch, "dGPU device mismatch");
+    Expect(InterpretDgpu({awake}, {{1, 0, 3, 45000}}).status == DgpuStatus::Unsupported, "dGPU NVML not supported");
+    Expect(InterpretDgpu({awake}, {{1, 0, 15, 45000}}).status == DgpuStatus::ReadFailed, "dGPU NVML read error");
+    for (const unsigned mw : {0u, 1000000u, 1000001u})
+        Expect(InterpretDgpu({awake}, {{1, 0, 0, mw}}).status == DgpuStatus::Glitch, "dGPU unknown-limit glitch");
+    Expect(InterpretDgpu({awake}, {{1, 0, 0, 999999}}).status == DgpuStatus::Valid, "dGPU upper unknown-limit valid boundary");
+    Expect(InterpretDgpu({awake}, {{1, 0, 0, 125000, 100000, true}}).status == DgpuStatus::Valid, "dGPU exact 1.25 limit is valid");
+    Expect(InterpretDgpu({awake}, {{1, 0, 0, 125001, 100000, true}}).status == DgpuStatus::Glitch, "dGPU over 1.25 limit is glitch");
+    Expect(InterpretDgpu({awake}, {{1, 0, 0, 590006, 140000, true}}).status == DgpuStatus::Glitch, "dGPU 590W wake glitch rejected");
+    Expect(DgpuPowerGlitch(0, 100000, true), "dGPU known-limit zero is glitch");
+    Expect(DgpuPowerGlitch(1, 0, true), "dGPU successful zero limit stays distinct from unknown limit");
+    Expect(!DgpuPowerGlitch(0xffffffffu, 0xffffffffu, true), "dGPU limit comparison does not overflow");
+    result = InterpretDgpu({awake, asleep}, {{1, 0, 0, 45000}, {2, 0, 0, 20000}});
+    Expect(result.status == DgpuStatus::Valid && result.watts == 45 && result.matched == 1, "dGPU ignores sleeping board");
+    result = InterpretDgpu({awake, {0x10DE, 2, 0, 1}}, {{1, 0, 0, 45000}, {2, 0, 0, 20000}});
+    Expect(result.status == DgpuStatus::Valid && result.watts == 65 && result.matched == 2, "dGPU sums awake matched boards");
+    result = InterpretDgpu({awake, awake}, {{1, 0, 0, 45000}, {1, 0, 0, 45000}});
+    Expect(result.status == DgpuStatus::Valid && result.watts == 45 && result.matched == 1, "dGPU deduplicates PCI identity");
+    result = InterpretDgpu({awake, {0x10DE, 2, 0, 1}}, {{1, 0, 0, 45000}, {2, 0, 3, 0}});
+    Expect(result.status == DgpuStatus::Unsupported && std::isnan(result.watts), "dGPU never publishes partial power on failure");
+    Expect(std::isnan(InterpretDgpu({asleep}, {{2, 0, 0, 20000}}).watts), "sleeping dGPU watts remain unknown");
+
+    DgpuHistory history;
+    const auto glitch = InterpretDgpu({awake}, {{1, 0, 0, 590006, 140000, true}});
+    Expect(history.Apply(glitch, 0).status == DgpuStatus::Glitch, "dGPU first glitch has no cached watts");
+    result = history.Apply(InterpretDgpu({awake}, {{1, 0, 0, 12390, 140000, true}}), 1000);
+    Expect(result.status == DgpuStatus::Valid && result.watts == 12.39, "dGPU valid sample seeds cache");
+    result = history.Apply(glitch, 5900);
+    Expect(result.status == DgpuStatus::Valid && result.watts == 12.39, "dGPU 4.9 second glitch reuses valid watts");
+    result = history.Apply(glitch, 6000);
+    Expect(result.status == DgpuStatus::Glitch && std::isnan(result.watts), "dGPU 5 second glitch expires cache without extending it");
+    Expect(history.Apply(glitch, 9000).status == DgpuStatus::Glitch, "dGPU repeated glitches never extend cache");
+    Expect(history.Apply({DgpuStatus::NoMatch, NAN, 0}, 2000).status == DgpuStatus::NoMatch, "cache never masks NoMatch");
+    Expect(history.Apply({DgpuStatus::ReadFailed, NAN, 1}, 2000).status == DgpuStatus::ReadFailed, "cache never masks NVML errors");
+    Expect(history.Apply({DgpuStatus::Sleeping, NAN, 0}, 2000).status == DgpuStatus::Sleeping, "cache never masks sleep");
+    Expect(history.Apply({DgpuStatus::Glitch, NAN, 2}, 2000).status == DgpuStatus::Glitch, "cache does not mix board sets");
+    history.Reset();
+    Expect(history.Apply(glitch, 2000).status == DgpuStatus::Glitch, "closing session drops cached watts");
+
+    using namespace pulse::ui;
+    Components components;
+    Expect(!Wants{}.dgpu_power, "dGPU default collection off");
+    Expect(CollectionWants(components, DisplayMode::Full).dgpu_power, "full Hardware requests dGPU power");
+    Expect(!CollectionWants(components, DisplayMode::Compact).dgpu_power, "compact never requests dGPU power");
+    Expect(!CollectionWants(components, DisplayMode::Taskbar).dgpu_power, "taskbar strip never requests dGPU power");
+    Expect(!CollectionWants(components, DisplayMode::Taskbar, true).dgpu_power, "taskbar details keep dGPU power off");
+    Expect(!CollectionWants(components, DisplayMode::Compact, true).dgpu_power, "compact display keeps dGPU power off even with details flag");
+    components.full[static_cast<std::size_t>(FullComponent::Hardware)] = false;
+    components.full[static_cast<std::size_t>(FullComponent::PowerChart)] = true;
+    Expect(!CollectionWants(components, DisplayMode::Full).dgpu_power, "full chart without Hardware leaves dGPU off");
+    components.full[static_cast<std::size_t>(FullComponent::Hardware)] = true;
+    for (const auto language : {i18n::Preference::Chinese, i18n::Preference::English}) {
+        i18n::SetLanguage(language);
+        const bool chinese = language == i18n::Preference::Chinese;
+        Model model;
+        Snapshot s = Base();
+        s.dgpu_status = DgpuStatus::Valid;
+        s.dgpu_w = 45.0;
+        model.Update(s, false, components);
+        // Keep the existing WattSuffix spacing used throughout the UI.
+        ExpectEq(model.Data().gpuW, chinese ? L"独显 45 W" : L"dGPU 45 W", "localized dGPU valid watts");
+        s.dgpu_w = 9.5;
+        model.Update(s, false, components);
+        ExpectEq(model.Data().gpuW, T(Key::DgpuPrefix) + L"9.5" + T(Key::WattSuffix), "dGPU keeps one decimal below 10 W");
+        s.dgpu_w = 100;
+        model.Update(s, false, components);
+        ExpectEq(model.Data().gpuW, T(Key::DgpuPrefix) + L"100" + T(Key::WattSuffix), "dGPU rounds large watts to integer");
+        s.dgpu_status = DgpuStatus::Sleeping;
+        model.Update(s, false, components);
+        ExpectEq(model.Data().gpuW, chinese ? L"独显休眠" : L"dGPU idle", "localized dGPU sleep label");
+        s.gpu_meter = MeterStatus::Valid;
+        s.gpu_w = 5;
+        s.dgpu_status = DgpuStatus::Glitch;
+        model.Update(s, false, components);
+        ExpectEq(model.Data().gpuW, chinese ? L"独显 --" : L"dGPU --", "localized dGPU glitch overrides pp1");
+        for (const auto status : {DgpuStatus::NoNvidia, DgpuStatus::NvmlUnavailable, DgpuStatus::NoMatch,
+                                  DgpuStatus::Unsupported, DgpuStatus::ReadFailed, DgpuStatus::Off}) {
+            s.dgpu_status = status;
+            model.Update(s, false, components);
+            ExpectEq(model.Data().gpuW, L"5.0" + T(Key::WattSuffix), "dGPU unavailable preserves pp1 text in both languages");
+        }
+        s.gpu_meter = MeterStatus::ReadFailed;
+        model.Update(s, false, components);
+        ExpectEq(model.Data().gpuW, T(Key::MeterReadFailed), "dGPU fallback preserves pp1 failure reason");
+    }
+}
+
 }  // namespace
 
 int main() {
+    CheckProbeHttpStatus();
     CheckClassifier();
     CheckAcDischargeDebounce();
     CheckMeterInterpretation();
@@ -878,6 +1018,7 @@ int main() {
     CheckSchemeModel();
     CheckSystemEtaModel();
     CheckCollectionTrace();
+    CheckDgpu();
     if (g_fails) {
         std::printf("FAILED %d\n", g_fails);
         return 1;

@@ -4,7 +4,8 @@
     卸载当前用户安装的 Pulse。
 .DESCRIPTION
     结束 Pulse 进程，删除开机自启、开始菜单和桌面快捷方式。
-    配置与日志位于 %LOCALAPPDATA%\Pulse（settings.ini、pulse_net.log）。
+    配置或日志文件位于 %LOCALAPPDATA%\Pulse（兼查 %APPDATA%\Pulse）：
+    settings.ini、pulse_net.log、pulse_net.log.1、power-diagnostics.txt。
     发现这些文件时默认询问是否删除。不需要管理员。
 #>
 [CmdletBinding()]
@@ -222,7 +223,7 @@ function Remove-KnownShortcut([string]$ShortcutPath, [string]$Label) {
 
 function Get-PulseDataFiles {
     $result = @()
-    $names = @('settings.ini', 'pulse_net.log')
+    $names = @('settings.ini', 'pulse_net.log', 'pulse_net.log.1', 'power-diagnostics.txt')
     $dirs = @()
     if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
         $dirs += (Join-Path $env:LOCALAPPDATA 'Pulse')
@@ -238,7 +239,7 @@ function Get-PulseDataFiles {
             }
         }
     }
-    return ,$result
+    return $result
 }
 
 function Remove-EmptyDirectory([string]$Directory) {
@@ -302,7 +303,7 @@ try {
         Write-Host ("选 Y 会删除整个安装目录 `"{0}`"（含 Pulse.exe 和上述文件）。选 N 只删除 Pulse.exe 和快捷方式，保留这些文件。" -f $installDir)
         $removeData = Read-YesNo '是否一并删除这些文件？'
     } else {
-        Write-Host ("未发现 settings.ini 或 pulse_net.log，将删除安装目录 `"{0}`"。" -f $installDir)
+        Write-Host ("未发现配置或日志文件，将删除安装目录 `"{0}`"。" -f $installDir)
         $removeData = $true
     }
 
