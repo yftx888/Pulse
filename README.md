@@ -195,7 +195,7 @@ PowerShell：
 ```bat
 scripts\package.cmd
 scripts\package.cmd -NoBuild
-scripts\package.cmd -Version 1.2.1
+scripts\package.cmd -Version 1.3.0
 ```
 
 `-NoBuild` 仅在仓库根目录已有 `Pulse.exe` 时跳过编译。未指定 `-Version` 时，从 `app.rc` 的 `FileVersion` 读取，读不到则用 `0.1.0`。输出为 `dist\Pulse-<版本>-win-x64.zip`，包含 `Pulse.exe`、本说明、`LICENSE`、`THIRD_PARTY_NOTICES.md` 和 `scripts\` 下的安装、卸载脚本。

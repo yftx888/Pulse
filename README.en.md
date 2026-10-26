@@ -195,7 +195,7 @@ To package a zip (runs `build.bat` first):
 ```bat
 scripts\package.cmd
 scripts\package.cmd -NoBuild
-scripts\package.cmd -Version 1.2.1
+scripts\package.cmd -Version 1.3.0
 ```
 
 `-NoBuild` skips compilation only if `Pulse.exe` already exists in the repository root. Without `-Version`, the script reads `FileVersion` from `app.rc`, falling back to `0.1.0` if it cannot be read. The output is `dist\Pulse-<version>-win-x64.zip`, containing `Pulse.exe`, `README.md`, `LICENSE`, `THIRD_PARTY_NOTICES.md`, and the installation and uninstallation scripts from `scripts\`.
