@@ -1,4 +1,4 @@
-﻿#include "ui_renderer.h"
+#include "ui_renderer.h"
 #include <d2d1helper.h>
 #include <dwmapi.h>
 #include <algorithm>
@@ -206,6 +206,35 @@ bool Renderer::SetCompactEtaVisible(bool visible) {
     if (!compact_ || !components_.Enabled(CompactComponent::Eta)) return false;
     UpdateCompactLayout();
     return true;
+}
+void Renderer::SetTextColors(const TextColors& colors) {
+    textColors_ = colors;
+    hasTextColors_ = false;
+    for (size_t i = 0; i < colors.size(); ++i) {
+        if (!colors[i]) continue;
+        customInk_[i] = Color(*colors[i]);
+        hasTextColors_ = true;
+    }
+}
+COLORREF Renderer::DefaultValueColor(CompactComponent c, const View& v) const {
+    auto ink = TextColor;
+    switch (c) {
+    case CompactComponent::Battery:
+        ink = v.supplemental ? Drain :
+            v.mode == PowerMode::Charging || (v.acOnline && (v.mode == PowerMode::AcIdle || v.supplemental)) ? Charge : TextColor; break;
+    case CompactComponent::Eta:
+        ink = v.mode == PowerMode::Discharging ? Drain :
+            v.mode == PowerMode::Charging ? Charge : TextColor; break;
+    case CompactComponent::Power: ink = Accent(v); break;
+    case CompactComponent::Cpu: case CompactComponent::DiskIO: ink = Down; break;
+    case CompactComponent::Memory: case CompactComponent::Network: ink = Up; break;
+    case CompactComponent::Gpu: case CompactComponent::Fps: ink = Charge; break;
+    case CompactComponent::GpuTemp: ink = GpuTempColor(v, Charge); break;
+    case CompactComponent::Latency: ink = NetworkColor(v.netState); break;
+    default: break;
+    }
+    return RGB(static_cast<BYTE>(std::lround(ink.r * 255)), static_cast<BYTE>(std::lround(ink.g * 255)),
+               static_cast<BYTE>(std::lround(ink.b * 255)));
 }
 void Renderer::Resize() {
     if (!target_) return;
@@ -791,7 +820,8 @@ void Renderer::UpdateCompactLayout() {
     compactCells_ = {};
     float width = 12;
     bool any = false;
-    for (size_t i = 0; i < CompactComponents.size(); ++i) {
+    for (auto ordered : components_.compactOrder) {
+        const auto i = static_cast<size_t>(ordered);
         if (!components_.compact[i]) continue;
         if (static_cast<CompactComponent>(i) == CompactComponent::Eta && !compactEtaVisible_) continue;
         auto& cell = compactCells_[i];
@@ -846,10 +876,11 @@ void Renderer::UpdateCompactLayout() {
     }
     compactWidth_ = std::ceil(width + 9 + 24 + 6);
 }
-void Renderer::CompactContent(const View& v) {
+template<bool CustomColors> void Renderer::CompactContent(const View& v) {
     float x = 12;
     bool any = false;
-    for (size_t i = 0; i < CompactComponents.size(); ++i) {
+    for (auto ordered : components_.compactOrder) {
+        const auto i = static_cast<size_t>(ordered);
         if (!components_.compact[i]) continue;
         if (static_cast<CompactComponent>(i) == CompactComponent::Eta && !v.compactEtaVisible) continue;
         if (any) {
@@ -860,6 +891,12 @@ void Renderer::CompactContent(const View& v) {
         const auto component = static_cast<CompactComponent>(i);
         const auto& cell = compactCells_[i];
         const float width = cell.width;
+        auto ink = [&](D2D1_COLOR_F normal) {
+            if constexpr (CustomColors) {
+                if (textColors_[i] && !PreserveValueColor(component, v)) return customInk_[i];
+            }
+            return normal;
+        };
         auto value = [&](const std::wstring& label, const std::wstring& text, D2D1_COLOR_F color) {
             const float labelWidth = cell.labelWidth;
             Text(label, Rect(x, 11, labelWidth - 4, 18), 10.5f, Muted);
@@ -886,40 +923,40 @@ void Renderer::CompactContent(const View& v) {
                 Line(x + 6.5f, 20, x + 11.5f, 20, plug, 1.5f);
                 Line(x + 9, 20, x + 9, 23, plug, 1.5f);
             }
-            Text(text, Rect(x + 26, 8, width - 26, 24), 13, v.supplemental ? Drain : ac ? Charge : TextColor, true, true);
+            Text(text, Rect(x + 26, 8, width - 26, 24), 13, ink(v.supplemental ? Drain : ac ? Charge : TextColor), true, true);
             break;
         }
         case CompactComponent::Eta: {
-            auto color = v.mode == PowerMode::Discharging ? Drain :
-                         v.mode == PowerMode::Charging ? Charge : TextColor;
+            auto color = ink(v.mode == PowerMode::Discharging ? Drain :
+                             v.mode == PowerMode::Charging ? Charge : TextColor);
             if (v.compactEtaFromSystem) color = Alpha(color, .65f);
             if (v.compactEtaLabel.empty())
                 Text(v.compactEtaValue, Rect(x, 8, width, 24), 13, color, true, true);
             else value(v.compactEtaLabel, v.compactEtaValue, color);
             break;
         }
-        case CompactComponent::Power: value(v.powerLabel, v.powerValue + T(Key::WattSuffix), Accent(v)); break;
-        case CompactComponent::Cpu: value(T(Key::Cpu), v.cpuValue, Down); break;
-        case CompactComponent::Memory: value(T(Key::Memory), v.memoryValue, Up); break;
-        case CompactComponent::Gpu: value(T(Key::Gpu), v.gpuUsage, Charge); break;
-        case CompactComponent::GpuTemp: value(T(Key::TaskbarGpuTemp), v.gpuTemp, GpuTempColor(v, Charge)); break;
+        case CompactComponent::Power: value(v.powerLabel, v.powerValue + T(Key::WattSuffix), ink(Accent(v))); break;
+        case CompactComponent::Cpu: value(T(Key::Cpu), v.cpuValue, ink(Down)); break;
+        case CompactComponent::Memory: value(T(Key::Memory), v.memoryValue, ink(Up)); break;
+        case CompactComponent::Gpu: value(T(Key::Gpu), v.gpuUsage, ink(Charge)); break;
+        case CompactComponent::GpuTemp: value(T(Key::TaskbarGpuTemp), v.gpuTemp, ink(GpuTempColor(v, Charge))); break;
         case CompactComponent::Network:
         case CompactComponent::DiskIO: {
             const bool network = component == CompactComponent::Network;
             const auto& first = network ? v.compactUp : v.diskRead;
             const auto& second = network ? v.compactDown : v.diskWrite;
-            Text(first, Rect(x, 4, width, 16), 10.5f, network ? Up : Down, false, true);
-            Text(second, Rect(x, 20, width, 16), 10.5f, network ? Down : Up, false, true);
+            Text(first, Rect(x, 4, width, 16), 10.5f, ink(network ? Up : Down), false, true);
+            Text(second, Rect(x, 20, width, 16), 10.5f, ink(network ? Down : Up), false, true);
             break;
         }
-        case CompactComponent::Latency: value(T(Key::Latency), v.latency, NetworkColor(v.netState)); break;
-        case CompactComponent::CpuFrequency: value(T(Key::Frequency), v.cpuFrequency, TextColor); break;
+        case CompactComponent::Latency: value(T(Key::Latency), v.latency, ink(NetworkColor(v.netState))); break;
+        case CompactComponent::CpuFrequency: value(T(Key::Frequency), v.cpuFrequency, ink(TextColor)); break;
         case CompactComponent::Fps:
             if (v.fpsAdmin) {
                 const float labelWidth = cell.labelWidth;
                 Text(T(Key::FpsShort), Rect(x, 11, labelWidth - 4, 18), 10.5f, Muted);
                 Text(v.fps, Rect(x + labelWidth, 11, width - labelWidth, 18), 10.5f, Faint);
-            } else value(T(Key::FpsShort), v.fps, Charge);
+            } else value(T(Key::FpsShort), v.fps, ink(Charge));
             break;
         default: break;
         }
@@ -935,7 +972,9 @@ void Renderer::Compact(const View& v, bool pinned, Button hover, Button pressed)
         target_->PushAxisAlignedClip(Rect(0, 0, std::max(0.0f, width - 36), 40), D2D1_ANTIALIAS_MODE_ALIASED);
         target_->SetTransform(D2D1::Matrix3x2F::Translation(-scroll_, 0));
     }
-    CompactContent(v);
+    // The default path compiles out per-value custom-color checks.
+    if (hasTextColors_) CompactContent<true>(v);
+    else CompactContent<false>(v);
     if (clipped) {
         target_->SetTransform(D2D1::Matrix3x2F::Identity());
         target_->PopAxisAlignedClip();

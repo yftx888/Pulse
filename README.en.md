@@ -23,7 +23,7 @@ Mini mode is a single line that can show Battery %, Time left or Full in, a char
 Taskbar mode embeds two rows of data in the taskbar, so it takes no desktop space. By default it shows Network speed, Time left / Full in, Power, CPU, Memory, and Latency:
 
 - By default (Automatic), it sits on the right side of the taskbar next to the clock. On Windows 11 with centered taskbar icons, when many open apps would put icons under it, it moves to the left of the Start button and leaves room for Widgets on the left. If neither side has room, it stays where it is instead of jumping back and forth. Taskbar position in the right-click menu can fix it to the left or right.
-- Text colors follow the light or dark taskbar. The battery estimate shows time left while discharging and time to full while charging.
+- Default text colors follow the light or dark taskbar. The battery estimate shows time left while discharging and time to full while charging.
 - Left-click shows or hides the Full mode panel; right-click opens the menu. It re-embeds itself automatically after Explorer restarts.
 - Vertical or side taskbars are not supported yet. If embedding fails, Pulse temporarily shows the Mini mode window and retries about every 30 seconds. The Windows 10 taskbar has not been tested.
 
@@ -41,7 +41,8 @@ Other features:
 
 - Foreground app FPS, measured through ETW DXGI/D3D9 Present events, requires administrator privileges. If FPS is enabled without sufficient privileges, the menu offers Restart as administrator (for FPS). Some apps may not expose a readable frame rate.
 - GPU temperature uses the same data source as Task Manager and needs no administrator privileges; with several GPUs, the hottest one is shown. It is usually available on discrete GPUs (NVIDIA / AMD) and AMD integrated graphics; Intel integrated graphics that do not report a temperature show none. It does not wake a sleeping discrete GPU. CPU temperature would require a kernel driver and is not provided.
-- Full mode refreshes every 0.5 / 1 / 2 seconds, with a default of 1 second. Mini mode and Taskbar mode refresh about every 2 seconds.
+- Full mode refreshes every 0.5 / 1 / 2 seconds, with a default of 1 second. Mini and Taskbar modes offer 1 / 2 / 5 seconds, with a default of 2 seconds. Opening the taskbar details panel uses the Full mode interval.
+- Mini window opacity offers 100% (default) / 90% / 80% / 70% / 60%. All three modes support Select all and Select none. Mini and Taskbar modes each have independent value text colors and component ordering, while warning colors are preserved.
 - Slow latency threshold can be set to 50 / 100 / 150 / 200 / 300 / 500 / 800 ms, with a default of 500 ms.
 - Network disconnected and Network restored cards fade out after about 8 seconds. Hovering pauses the timer; moving away starts a roughly 3-second timer before they fade out. Disconnect alerts and Alert sound have separate switches. Sleep does not count as an outage.
 - Size from 80% to 200%, also adjustable with Ctrl + mouse wheel.
@@ -104,7 +105,9 @@ Startup uses the current user's `HKCU\Software\Microsoft\Windows\CurrentVersion\
 
 Run `scripts\uninstall.cmd`. The script exits only Pulse processes identified as this app by window class or version information, skipping other programs with the same name. It removes the Run value described above and removes Start menu and desktop `Pulse.lnk` shortcuts that target `Pulse.exe` or have no target.
 
-Window position, mode, Always on top, component selections, Taskbar position, Refresh interval, Size, language (`[Window] language=auto|zh|en`), Slow latency threshold, Disconnect alerts, and Alert sound are saved in `%LOCALAPPDATA%\Pulse\settings.ini`. Logs for network probes, frame-rate diagnostics, and other events are stored in `%LOCALAPPDATA%\Pulse\pulse_net.log`, in the same folder as the installed app. When the log exceeds 1 MB, it is renamed to `pulse_net.log.1` and a new log is started. No settings are written to `%APPDATA%` (the roaming directory), but the uninstaller still checks it for settings and logs with the same names.
+Window position, mode, Always on top, component selections, component order and text colors, Mini opacity, Taskbar position, both refresh intervals, Size, language (`[Window] language=auto|zh|en`), Slow latency threshold, Disconnect alerts, and Alert sound are saved in `%LOCALAPPDATA%\Pulse\settings.ini`. Logs for network probes, frame-rate diagnostics, and other events are stored in `%LOCALAPPDATA%\Pulse\pulse_net.log`, in the same folder as the installed app. When the log exceeds 1 MB, it is renamed to `pulse_net.log.1` and a new log is started. No settings are written to `%APPDATA%` (the roaming directory), but the uninstaller still checks it for settings and logs with the same names.
+
+Refresh intervals use `[Window] refresh_ms=500|1000|2000` (default 1000) and `mini_refresh_ms=1000|2000|5000` (default 2000). Mini opacity uses `[Compact] opacity=100|90|80|70|60` (default 100). `[Compact]` and `[Taskbar]` each store `order` (comma-separated component keys) and `color_<key>=#RRGGBB` (for example, `color_cpu=#38BDF8`). Unknown or duplicate order keys are ignored; missing components are appended in the mode's default order. Missing or invalid colors use the defaults, and Reset colors deletes the corresponding color keys.
 
 If these files exist, the script asks whether to remove them. Choosing Y deletes the entire `%LOCALAPPDATA%\Pulse` directory and any detected settings and log files in the roaming directory. Choosing N removes only `Pulse.exe` and the shortcuts, keeping settings and logs. If no settings or logs are found, the installation directory is removed by default.
 
@@ -131,13 +134,16 @@ The window, the taskbar data, and the tray icon share this context menu:
 | Full mode / Mini mode / Taskbar mode | Switches display mode |
 | Taskbar position | Automatic (default) / Right / Left. Right is next to the clock; Left is to the left of the Start button. Right and Left stay fixed |
 | Size | 80% / 100% (default) / 125% / 150% / 175% / 200% |
+| Mini opacity | 100% (default) / 90% / 80% / 70% / 60%; affects only the floating Mini window, including fallback when taskbar embedding fails |
 | 语言 / Language | Follow system (default), 中文, or English |
-| Refresh interval | Sets Full mode's refresh interval to 0.5 / 1 (default) / 2 seconds |
+| Refresh interval | Two independent groups: Full mode at 0.5 / 1 (default) / 2 seconds; Mini / Taskbar at 1 / 2 (default) / 5 seconds |
 | Slow latency threshold | 50 / 100 / 150 / 200 / 300 / 500 (default) / 800 ms |
 | Disconnect alerts | Toggles Network disconnected and Network restored cards; enabled by default |
 | Alert sound | Toggles sound separately; enabled by default and unavailable when Disconnect alerts are disabled |
-| Show items → Full mode / Mini mode / Taskbar mode | Selects components for each mode |
-| Show items → Reset to defaults | Resets only the default component selections for all three modes |
+| Show items → Full mode / Mini mode / Taskbar mode | Selects components for each mode, with Select all (including FPS) and Select none |
+| Show items → Mini mode / Taskbar mode → Reorder | Moves enabled components up, down, to first, or to last; the component checklist follows the same order |
+| Show items → Mini mode / Taskbar mode → Text color | Sets value text colors for enabled components separately per mode, preserving labels and warnings; Reset colors affects only that mode |
+| Show items → Reset to defaults | Resets selections for all three modes and Mini / Taskbar order; keeps colors and opacity |
 | Always on top | Toggles pinning the window above others |
 | Start with Windows | Toggles startup for the current user |
 | Power diagnostics | Starts a separate process that samples for about one second, writes the plan, signed battery rate, and Energy Meter instances to `%LOCALAPPDATA%\Pulse\power-diagnostics.txt`, and opens it. Nothing is uploaded and settings are not changed |

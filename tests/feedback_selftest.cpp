@@ -9,7 +9,7 @@
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0A00
 #endif
-#include "ui_model.h"
+#include "ui_prefs.h"
 #include "power_diagnostics.h"
 #include "probe_status.h"
 
@@ -1007,6 +1007,195 @@ void CheckDgpu() {
     }
 }
 
+void CheckUiPreferences() {
+    using namespace pulse::ui;
+    using C = CompactComponent;
+    for (const auto interval : MiniRefreshIntervals)
+        Expect(ParseMiniRefresh(std::to_wstring(interval)) == interval, "mini interval whitelist round trip");
+    for (const auto* value : {L"", L"0", L"500", L"2001", L"-1000", L"1000x", L" 1000", L"99999999999999999999"})
+        Expect(ParseMiniRefresh(value) == 2000u, "invalid mini interval defaults to 2 seconds");
+    Expect(MiniTimerTolerance(1000) == 150 && MiniTimerTolerance(2000) == 300 &&
+        MiniTimerTolerance(5000) == 500 && MiniTimerTolerance(0) == 300, "mini timer tolerances and fallback");
+    for (const int opacity : MiniOpacities)
+        Expect(ParseMiniOpacity(std::to_wstring(opacity)) == opacity, "mini opacity whitelist round trip");
+    for (const auto* value : {L"", L"0", L"50", L"101", L"-60", L"90%", L"90x", L" 90"})
+        Expect(ParseMiniOpacity(value) == 100, "invalid mini opacity defaults to opaque");
+
+    ExpectEq(FormatComponentOrder(DefaultCompactOrder),
+        L"battery,eta,power,cpu,memory,gpu,network,latency,disk_io,cpu_freq,fps,gpu_temp", "compact default order preserves appearance");
+    ExpectEq(FormatComponentOrder(DefaultTaskbarOrder),
+        L"network,eta,power,battery,cpu,memory,gpu,latency,cpu_freq,fps,gpu_temp,disk_io", "taskbar default order preserves appearance");
+    for (const auto& defaults : {DefaultCompactOrder, DefaultTaskbarOrder}) {
+        Expect(ParseComponentOrder(L"", defaults) == defaults, "empty order uses mode default");
+        Expect(ParseComponentOrder(L"unknown,,bad", defaults) == defaults, "unknown order keys ignored");
+        Expect(ParseComponentOrder(FormatComponentOrder(defaults), defaults) == defaults, "component order round trip");
+        const auto parsed = ParseComponentOrder(L"cpu,unknown,cpu,,battery,", defaults);
+        ComponentOrder expected{};
+        expected[0] = C::Cpu; expected[1] = C::Battery;
+        std::size_t next = 2;
+        for (auto c : defaults) if (c != C::Cpu && c != C::Battery) expected[next++] = c;
+        Expect(parsed == expected, "order ignores duplicates and appends missing keys in default order");
+        Expect(parsed.back() == expected.back(), "older order gains newly added components");
+    }
+
+    Components components;
+    SelectComponents(components.full, true);
+    SelectComponents(components.compact, true);
+    SelectComponents(components.taskbar, true);
+    Expect(std::all_of(components.full.begin(), components.full.end(), [](bool on) { return on; }) &&
+        std::all_of(components.compact.begin(), components.compact.end(), [](bool on) { return on; }) &&
+        std::all_of(components.taskbar.begin(), components.taskbar.end(), [](bool on) { return on; }), "select all covers every component");
+    Expect(components.full[static_cast<std::size_t>(FullComponent::Fps)] &&
+        components.compact[static_cast<std::size_t>(C::Fps)] && components.taskbar[static_cast<std::size_t>(C::Fps)], "select all includes FPS");
+    SelectComponents(components.compact, false);
+    Expect(std::none_of(components.compact.begin(), components.compact.end(), [](bool on) { return on; }) &&
+        components.full[0] && components.taskbar[0], "select none affects only its mode");
+    SelectComponents(components.full, false);
+    SelectComponents(components.taskbar, false);
+    Expect(std::none_of(components.full.begin(), components.full.end(), [](bool on) { return on; }) &&
+        std::none_of(components.taskbar.begin(), components.taskbar.end(), [](bool on) { return on; }), "all modes allow no components");
+
+    ComponentSelection enabled{};
+    auto enable = [&](C c) { enabled[static_cast<std::size_t>(c)] = true; };
+    auto order = DefaultCompactOrder;
+    const auto original = order;
+    Expect(!CanMoveComponent(order, enabled, C::Cpu, true) &&
+        !CanMoveComponent(order, enabled, C::Cpu, false) &&
+        !MoveComponent(order, enabled, C::Cpu, ComponentMove::First), "empty selection cannot move");
+    enable(C::Cpu);
+    for (auto move : {ComponentMove::Up, ComponentMove::Down, ComponentMove::First, ComponentMove::Last})
+        Expect(!MoveComponent(order, enabled, C::Cpu, move) && order == original, "single selection cannot move");
+    enable(C::Battery); enable(C::Latency);
+    Expect(!CanMoveComponent(order, enabled, C::Battery, true) && CanMoveComponent(order, enabled, C::Battery, false) &&
+        CanMoveComponent(order, enabled, C::Latency, true) && !CanMoveComponent(order, enabled, C::Latency, false), "move availability skips disabled items");
+    Expect(!MoveComponent(order, enabled, C::Battery, ComponentMove::Up) &&
+        !MoveComponent(order, enabled, C::Battery, ComponentMove::First) &&
+        !MoveComponent(order, enabled, C::Latency, ComponentMove::Down) &&
+        !MoveComponent(order, enabled, C::Latency, ComponentMove::Last), "moves at endpoints report no change");
+    Expect(!CanMoveComponent(order, enabled, C::Eta, true) && !CanMoveComponent(order, enabled, C::Eta, false) &&
+        !MoveComponent(order, enabled, C::Eta, ComponentMove::Last) &&
+        !MoveComponent(order, enabled, C::Count, ComponentMove::Up), "disabled and absent components cannot move");
+    Expect(MoveComponent(order, enabled, C::Cpu, ComponentMove::Up) && order[0] == C::Cpu && order[3] == C::Battery,
+        "move up swaps adjacent selected slots");
+    Expect(MoveComponent(order, enabled, C::Cpu, ComponentMove::Down) && order == original, "move down restores selected slots");
+    Expect(MoveComponent(order, enabled, C::Latency, ComponentMove::First) &&
+        order[0] == C::Latency && order[3] == C::Battery && order[7] == C::Cpu, "move first rotates selected components");
+    Expect(MoveComponent(order, enabled, C::Latency, ComponentMove::Last) && order == original, "move last rotates selected components");
+    MoveComponent(order, enabled, C::Battery, ComponentMove::Last);
+    bool disabledUnchanged = true;
+    for (std::size_t i = 0; i < original.size(); ++i)
+        if (!enabled[static_cast<std::size_t>(original[i])] && order[i] != original[i]) disabledUnchanged = false;
+    Expect(disabledUnchanged, "disabled entries retain positions and relative order");
+    Expect(ParseComponentOrder(FormatComponentOrder(order), DefaultCompactOrder) == order, "moved order survives persistence");
+
+    auto columnIs = [](const TaskbarColumn& col, std::initializer_list<C> items, bool speed = false) {
+        return col.count == items.size() && col.speed == speed && std::equal(items.begin(), items.end(), col.items.begin());
+    };
+    components.Reset();
+    auto columns = TaskbarColumns(components.taskbarOrder, components.taskbar);
+    Expect(columns.size() == 4 && columnIs(columns[0], {C::Network}, true) &&
+        columnIs(columns[1], {C::Eta, C::Power}) && columnIs(columns[2], {C::Cpu, C::Memory}) &&
+        columnIs(columns[3], {C::Latency}), "taskbar default selection matches original four columns");
+    SelectComponents(components.taskbar, true);
+    columns = TaskbarColumns(components.taskbarOrder, components.taskbar);
+    Expect(columns.size() == 7 && columnIs(columns[0], {C::Network}, true) && columnIs(columns[1], {C::Eta, C::Power}) &&
+        columnIs(columns[2], {C::Battery, C::Cpu}) && columnIs(columns[3], {C::Memory, C::Gpu}) &&
+        columnIs(columns[4], {C::Latency, C::CpuFrequency}) && columnIs(columns[5], {C::Fps, C::GpuTemp}) &&
+        columnIs(columns[6], {C::DiskIO}, true), "taskbar all selected matches original seven columns");
+    Expect(columns == TaskbarColumns(DefaultTaskbarOrder, components.taskbar), "taskbar column equality");
+    SelectComponents(components.taskbar, false);
+    Expect(TaskbarColumns(DefaultTaskbarOrder, components.taskbar).empty(), "empty taskbar selection has no columns");
+    components.taskbar[static_cast<std::size_t>(C::Cpu)] = true;
+    columns = TaskbarColumns(DefaultTaskbarOrder, components.taskbar);
+    Expect(columns.size() == 1 && columnIs(columns[0], {C::Cpu}), "one ordinary component forms one column");
+    components.taskbar[static_cast<std::size_t>(C::Network)] = true;
+    components.taskbar[static_cast<std::size_t>(C::DiskIO)] = true;
+    order = ParseComponentOrder(L"cpu,network,disk_io", DefaultTaskbarOrder);
+    columns = TaskbarColumns(order, components.taskbar);
+    Expect(columns.size() == 3 && columnIs(columns[0], {C::Cpu}) && columnIs(columns[1], {C::Network}, true) &&
+        columnIs(columns[2], {C::DiskIO}, true), "standalone speed columns flush incomplete ordinary pair");
+    components.taskbar[static_cast<std::size_t>(C::Eta)] = true;
+    components.taskbar[static_cast<std::size_t>(C::Power)] = true;
+    order = ParseComponentOrder(L"cpu,power,network,eta,disk_io", DefaultTaskbarOrder);
+    columns = TaskbarColumns(order, components.taskbar);
+    Expect(columns.size() == 4 && columnIs(columns[0], {C::Cpu}) && columnIs(columns[1], {C::Eta, C::Power}) &&
+        columnIs(columns[2], {C::Network}, true) && columnIs(columns[3], {C::DiskIO}, true), "ETA power pair uses earliest position even when separated");
+    for (const auto single : {C::Eta, C::Power}) {
+        SelectComponents(components.taskbar, false);
+        components.taskbar[static_cast<std::size_t>(single)] = true;
+        components.taskbar[static_cast<std::size_t>(C::Cpu)] = true;
+        columns = TaskbarColumns(DefaultTaskbarOrder, components.taskbar);
+        Expect(columns.size() == 1 && columnIs(columns[0], {single, C::Cpu}), "unpaired ETA or power pairs as ordinary component");
+    }
+    MiniAppearance appearance;
+    appearance.opacity = 70;
+    appearance.compact[0] = 0x123456u;
+    appearance.taskbar[0] = 0xabcdefu;
+    components.compactOrder = order; components.taskbarOrder = order;
+    components.Reset();
+    bool defaultsRestored = components.compactOrder == DefaultCompactOrder && components.taskbarOrder == DefaultTaskbarOrder;
+    for (std::size_t i = 0; i < CompactComponents.size(); ++i)
+        defaultsRestored = defaultsRestored && components.compact[i] == CompactComponents[i].enabled &&
+            components.taskbar[i] == TaskbarComponents[i].enabled;
+    for (std::size_t i = 0; i < FullComponents.size(); ++i)
+        defaultsRestored = defaultsRestored && components.full[i] == FullComponents[i].enabled;
+    Expect(defaultsRestored && appearance.opacity == 70 && appearance.compact[0] == 0x123456u &&
+        appearance.taskbar[0] == 0xabcdefu, "reset restores selections and orders with appearance kept separately");
+
+    Expect(ParseTextColor(L"#000000") == 0u && ParseTextColor(L"#FFFFFF") == 0xffffffu &&
+        ParseTextColor(L"#aB09fF") == 0xab09ffu, "RGB parser accepts black white and mixed hex case");
+    for (const auto* value : {L"", L"#", L"#12345", L"#1234567", L"123456", L"0x123456", L"#12GG56", L" #123456", L"#123456 "})
+        Expect(!ParseTextColor(value), "invalid RGB syntax uses default color");
+    ExpectEq(FormatTextColor(std::nullopt), L"", "default color formats empty for ini key deletion");
+    ExpectEq(FormatTextColor(0x1000000u), L"", "out of range RGB formats empty");
+    ExpectEq(FormatTextColor(0u), L"#000000", "black is a custom color not default");
+    ExpectEq(FormatTextColor(0xab09ffu), L"#AB09FF", "RGB formatter emits six uppercase digits");
+    Expect(ParseTextColor(FormatTextColor(0xffffffu)) == 0xffffffu, "RGB formatter parser round trip");
+    appearance.compact.fill(std::nullopt);
+    Expect(!appearance.compact[0] && appearance.taskbar[0] == 0xabcdefu, "reset colors affects only one mode");
+    View view;
+    for (auto c : DefaultCompactOrder) Expect(!PreserveValueColor(c, view), "normal states allow custom color");
+    view.battery = .2f;
+    Expect(PreserveValueColor(C::Battery, view), "20 percent battery warning keeps red");
+    view.battery = 0;
+    Expect(PreserveValueColor(C::Battery, view), "empty battery warning keeps red");
+    view.battery = .21f;
+    Expect(!PreserveValueColor(C::Battery, view), "battery above 20 percent permits custom color");
+    view.supplemental = true;
+    Expect(PreserveValueColor(C::Battery, view) && PreserveValueColor(C::Eta, view) &&
+        PreserveValueColor(C::Power, view) && !PreserveValueColor(C::Cpu, view), "AC discharge warnings override custom color");
+    view.supplemental = false; view.low = true;
+    Expect(PreserveValueColor(C::Power, view), "low power warning keeps red");
+    view.low = false;
+    for (auto state : {pulse::NetState::Online, pulse::NetState::Checking, pulse::NetState::Slow, pulse::NetState::Offline}) {
+        view.netState = state;
+        Expect(PreserveValueColor(C::Latency, view) == (state == pulse::NetState::Slow || state == pulse::NetState::Offline),
+            "only slow and offline latency preserve state colors");
+    }
+    for (int level = 0; level <= 2; ++level) {
+        view.gpuTempLevel = level;
+        Expect(PreserveValueColor(C::GpuTemp, view) == (level >= 1), "GPU temperature warnings keep yellow and red");
+    }
+    view.fpsAdmin = true;
+    Expect(PreserveValueColor(C::Fps, view), "FPS admin hint keeps gray");
+    view.fpsAdmin = false; view.mode = pulse::PowerMode::Charging; view.compactEtaFromSystem = true;
+    Expect(!PreserveValueColor(C::Battery, view) && !PreserveValueColor(C::Eta, view) && !PreserveValueColor(C::Power, view),
+        "charging and system ETA permit custom colors");
+
+    for (auto language : {pulse::i18n::Preference::Chinese, pulse::i18n::Preference::English}) {
+        pulse::i18n::SetLanguage(language);
+        const bool chinese = language == pulse::i18n::Preference::Chinese;
+        const Key keys[] = {Key::MiniTaskbar, Key::RefreshOnePlain, Key::RefreshFive, Key::MiniOpacity,
+            Key::SelectAll, Key::SelectNone, Key::TextColor, Key::ResetColors, Key::Reorder,
+            Key::MoveUp, Key::MoveDown, Key::MoveFirst, Key::MoveLast};
+        const wchar_t* zh[] = {L"迷你 / 任务栏", L"1 秒", L"5 秒", L"迷你不透明度", L"全选", L"全不选",
+            L"文字颜色", L"恢复默认颜色", L"调整顺序", L"上移", L"下移", L"移到最前", L"移到最后"};
+        const wchar_t* en[] = {L"Mini / Taskbar", L"1 s", L"5 s", L"Mini opacity", L"Select all", L"Select none",
+            L"Text color", L"Reset colors", L"Reorder", L"Move up", L"Move down", L"Move to first", L"Move to last"};
+        for (std::size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i) ExpectEq(T(keys[i]), chinese ? zh[i] : en[i], "new menu text localized");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -1019,6 +1208,7 @@ int main() {
     CheckSystemEtaModel();
     CheckCollectionTrace();
     CheckDgpu();
+    CheckUiPreferences();
     if (g_fails) {
         std::printf("FAILED %d\n", g_fails);
         return 1;

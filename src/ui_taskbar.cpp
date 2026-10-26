@@ -67,7 +67,10 @@ Key Label(CompactComponent c, PowerMode mode = PowerMode::Unknown) {
 struct TaskbarStrip::Impl {
     HWND window = nullptr, owner = nullptr, shell = nullptr, bar = nullptr, tasks = nullptr;
     HINSTANCE instance = nullptr;
-    Components components;
+    Components components, modelComponents;
+    TextColors textColors{};
+    std::array<D2D1_COLOR_F, CompactComponents.size()> customInk{};
+    bool hasTextColors = false;
     Model model;
     bool dirty = true, layoutDirty = true, light = false, classic = false, closing = false;
     bool widgets = true, centered = true, reserved = false, registered = false, resizePending = false;
@@ -335,43 +338,26 @@ struct TaskbarStrip::Impl {
         cells.clear(); texts.clear();
         constexpr float padding = 2, columnGap = 4;
         float x = padding;
-        // Speed pairs own a column. ETA/power share a column when both are on;
-        // all remaining cells keep their enum order and pair without gaps.
-        std::vector<CompactComponent> ordinary;
-        auto addPair = [&](CompactComponent c) {
-            if (!components.taskbar[static_cast<size_t>(c)]) return;
-            const float label = std::ceil(c == CompactComponent::Network ?
-                std::max(Measure(L"↑"), Measure(L"↓")) :
-                std::max(Measure(T(Key::TaskbarRead)), Measure(T(Key::TaskbarWrite)))) + LabelGap;
-            const float width = label + ValueWidth(c);
-            cells.push_back({c, 0, x, width, label}); cells.push_back({c, 1, x, width, label});
-            x += width + columnGap;
-        };
-        addPair(CompactComponent::Network);
-        const bool batteryPair = components.taskbar[static_cast<size_t>(CompactComponent::Eta)] &&
-            components.taskbar[static_cast<size_t>(CompactComponent::Power)];
-        if (batteryPair) {
-            const float width = std::max(CellWidth(CompactComponent::Eta), CellWidth(CompactComponent::Power));
-            cells.push_back({CompactComponent::Eta, 0, x, width, LabelWidth(CompactComponent::Eta)});
-            cells.push_back({CompactComponent::Power, 1, x, width, LabelWidth(CompactComponent::Power)});
-            x += width + columnGap;
+        const auto columns = TaskbarColumns(components.taskbarOrder, components.taskbar);
+        for (const auto& column : columns) {
+            if (column.speed) {
+                const auto c = column.items[0];
+                const float label = std::ceil(c == CompactComponent::Network ?
+                    std::max(Measure(L"↑"), Measure(L"↓")) :
+                    std::max(Measure(T(Key::TaskbarRead)), Measure(T(Key::TaskbarWrite)))) + LabelGap;
+                const float width = label + ValueWidth(c);
+                cells.push_back({c, 0, x, width, label}); cells.push_back({c, 1, x, width, label});
+                x += width + columnGap;
+            } else {
+                float width = 0;
+                for (size_t row = 0; row < column.count; ++row)
+                    width = std::max(width, CellWidth(column.items[row]));
+                for (size_t row = 0; row < column.count; ++row)
+                    cells.push_back({column.items[row], static_cast<int>(row), x, width,
+                        LabelWidth(column.items[row])});
+                x += width + columnGap;
+            }
         }
-        for (size_t i = 0; i < components.taskbar.size(); ++i) {
-            const auto c = static_cast<CompactComponent>(i);
-            if (!components.taskbar[i] || c == CompactComponent::Network || c == CompactComponent::DiskIO) continue;
-            if (batteryPair && (c == CompactComponent::Eta || c == CompactComponent::Power)) continue;
-            ordinary.push_back(c);
-        }
-        for (size_t i = 0; i < ordinary.size(); i += 2) {
-            float width = 0;
-            for (size_t j = i; j < std::min(i + 2, ordinary.size()); ++j)
-                width = std::max(width, CellWidth(ordinary[j]));
-            for (size_t j = i; j < std::min(i + 2, ordinary.size()); ++j)
-                cells.push_back({ordinary[j], static_cast<int>(j - i), x, width,
-                    LabelWidth(ordinary[j])});
-            x += width + columnGap;
-        }
-        addPair(CompactComponent::DiskIO);
         logicalWidth = std::max(24.0f, x - columnGap + padding);
         width = static_cast<int>(std::ceil(logicalWidth * scale));
         height = std::min(taskbarHeight, std::max(1, static_cast<int>(std::ceil(36 * scale))));
@@ -535,7 +521,7 @@ struct TaskbarStrip::Impl {
             const auto& cell = cells[i];
             const auto c = cell.component;
             std::wstring label, value;
-            auto ink = normal;
+            D2D1_COLOR_F ink = normal;
             if (c == CompactComponent::Network || c == CompactComponent::DiskIO) {
                 const bool net = c == CompactComponent::Network;
                 label = net ? (cell.row ? L"↓" : L"↑") : T(cell.row ? Key::TaskbarWrite : Key::TaskbarRead);
@@ -570,6 +556,8 @@ struct TaskbarStrip::Impl {
                 default: break;
                 }
             }
+            const auto colorIndex = static_cast<size_t>(c);
+            if (hasTextColors && textColors[colorIndex] && !PreserveValueColor(c, v)) ink = customInk[colorIndex];
             const float y = 18.0f * cell.row;
             if (!label.empty())
                 DrawText(2 * i, label, D2D1::RectF(cell.x, y, cell.x + cell.label - LabelGap, y + 18), false, muted);
@@ -597,13 +585,57 @@ bool TaskbarStrip::Open(HINSTANCE instance, HWND owner) {
 }
 void TaskbarStrip::Close() { impl_->Close(); }
 void TaskbarStrip::Configure(const Components& c, int zoom, TaskbarPosition position, int widgetsWidth) {
-    if (impl_->components.taskbar != c.taskbar || impl_->zoom != zoom) impl_->layoutDirty = true;
+    if (impl_->components.taskbar != c.taskbar || impl_->components.taskbarOrder != c.taskbarOrder ||
+        impl_->zoom != zoom) impl_->layoutDirty = true;
     if (impl_->position != position) {
         impl_->autoSide = TaskbarPosition::Auto;
         impl_->dirty = true;
     }
-    impl_->components = c; impl_->zoom = zoom;
+    impl_->components = c;
+    impl_->modelComponents.full = c.full; impl_->modelComponents.compact = c.taskbar;
+    impl_->zoom = zoom;
     impl_->position = position; impl_->widgetsWidth = std::clamp(widgetsWidth, 0, 300);
+}
+void TaskbarStrip::SetTextColors(const TextColors& colors) {
+    if (impl_->textColors == colors) return;
+    impl_->textColors = colors;
+    impl_->hasTextColors = false;
+    for (size_t i = 0; i < colors.size(); ++i) {
+        if (!colors[i]) continue;
+        impl_->customInk[i] = D2D1::ColorF(*colors[i]);
+        impl_->hasTextColors = true;
+    }
+    impl_->dirty = true;
+}
+COLORREF TaskbarStrip::DefaultValueColor(CompactComponent c, const View& v) const {
+    if (!impl_->themeRead) impl_->ReadTheme();
+    const bool light = impl_->light;
+    unsigned rgb = light ? 0x202634u : 0xe9edf6u;
+    const unsigned green = light ? 0x00774bu : 0x34d399u;
+    const unsigned yellow = light ? 0x865b00u : 0xfbbf24u;
+    const unsigned red = light ? 0xb51c27u : 0xf87171u;
+    switch (c) {
+    case CompactComponent::Battery:
+        if (v.supplemental) rgb = yellow;
+        else if (v.mode == PowerMode::Charging || (v.mode == PowerMode::AcIdle && v.acOnline)) rgb = green;
+        else if (v.battery >= 0 && v.battery <= .2f) rgb = red;
+        break;
+    case CompactComponent::Eta: if (v.supplemental) rgb = yellow; else if (v.mode == PowerMode::Charging) rgb = green; break;
+    case CompactComponent::Power: rgb = v.low ? red : v.mode == PowerMode::Charging ? green : yellow; break;
+    case CompactComponent::Cpu: case CompactComponent::DiskIO: rgb = light ? 0x006c9du : 0x38bdf8u; break;
+    case CompactComponent::Memory: case CompactComponent::Network: rgb = light ? 0x6942b3u : 0xa78bfau; break;
+    case CompactComponent::Gpu: case CompactComponent::Fps: rgb = green; break;
+    case CompactComponent::GpuTemp: rgb = v.gpuTempLevel >= 2 ? red : v.gpuTempLevel == 1 ? yellow : green; break;
+    case CompactComponent::Latency:
+        rgb = v.netState == NetState::Offline ? red : v.netState == NetState::Slow ? yellow :
+            v.netState == NetState::Checking ? (light ? 0x41495bu : 0xb0bbd0u) : green; break;
+    default: break;
+    }
+    return RGB((rgb >> 16) & 255u, (rgb >> 8) & 255u, rgb & 255u);
+}
+void TaskbarStrip::Redraw() {
+    if (impl_->window && impl_->shell && IsWindowVisible(impl_->shell) && impl_->dirty)
+        if (!impl_->Paint()) impl_->Paint();
 }
 void TaskbarStrip::ThemeChanged() { impl_->ReadTheme(); }
 void TaskbarStrip::LanguageChanged() { impl_->layoutDirty = impl_->dirty = true; }
@@ -614,8 +646,7 @@ bool TaskbarStrip::Update(const Snapshot& snapshot) {
         impl_->Close();
         if (!impl_->Attach()) return false;
     }
-    Components selection = impl_->components; selection.compact = selection.taskbar;
-    if (impl_->model.Update(snapshot, true, selection, true)) impl_->dirty = true;
+    if (impl_->model.Update(snapshot, true, impl_->modelComponents, true)) impl_->dirty = true;
     if (!impl_->Track()) return false;
     if (IsWindowVisible(impl_->shell) && impl_->dirty && !impl_->Paint() && !impl_->Paint()) return false;
     impl_->loggedErrors.clear();

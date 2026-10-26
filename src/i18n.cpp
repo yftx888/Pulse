@@ -227,6 +227,19 @@ const Entry strings[] = {
     {L"无法启动功耗诊断（错误码：{0}）。", L"Could not start power diagnostics (error {0})."}, // PowerDiagnosticsLaunchFailed
     {L"独显 ", L"dGPU "}, // DgpuPrefix
     {L"独显休眠", L"dGPU idle"}, // DgpuSleeping
+    {L"迷你 / 任务栏", L"Mini / Taskbar"}, // MiniTaskbar
+    {L"1 秒", L"1 s"}, // RefreshOnePlain
+    {L"5 秒", L"5 s"}, // RefreshFive
+    {L"迷你不透明度", L"Mini opacity"}, // MiniOpacity
+    {L"全选", L"Select all"}, // SelectAll
+    {L"全不选", L"Select none"}, // SelectNone
+    {L"文字颜色", L"Text color"}, // TextColor
+    {L"恢复默认颜色", L"Reset colors"}, // ResetColors
+    {L"调整顺序", L"Reorder"}, // Reorder
+    {L"上移", L"Move up"}, // MoveUp
+    {L"下移", L"Move down"}, // MoveDown
+    {L"移到最前", L"Move to first"}, // MoveFirst
+    {L"移到最后", L"Move to last"}, // MoveLast
 };
 static_assert(sizeof(strings) / sizeof(strings[0]) == static_cast<std::size_t>(Key::Count), "i18n table size");
 Language current = Language::English;

@@ -1,5 +1,5 @@
 // Console profiler: --samples N (default 60), --compact, --brief, --url URL,
-// --interval-ms 500|1000|2000, --switch-every N, --slow-ms 300|500|800, --fps,
+// --interval-ms 500|1000|2000, --compact-interval-ms 1000|2000|5000, --switch-every N, --slow-ms 300|500|800, --fps,
 // --no-probe, --process-count-only, --gpu (five direct D3DKMT diagnostic rounds),
 // --nvml (manual NVML diagnostic; may wake a sleeping GPU),
 // --power (manual PDH/plan/battery report; does not start Metrics or the network).
@@ -575,7 +575,7 @@ void OnNet(const pulse::NetEvent& event, void*) {
 
 int wmain(int argc, wchar_t** argv) {
     _setmode(_fileno(stdout), _O_U16TEXT);
-    int samples = 60, interval_ms = 1000, switch_every = 0;
+    int samples = 60, interval_ms = 1000, compact_interval_ms = 2000, switch_every = 0;
     bool full = true, brief = false, fps_test = false, no_probe = false, count_only = false, gpu_test = false, power_test = false, nvml_test = false;
     pulse::Settings settings;
     for (int i = 1; i < argc; ++i) {
@@ -604,6 +604,12 @@ int wmain(int argc, wchar_t** argv) {
             const long value = std::wcstol(argv[++i], &end, 10);
             if (!end || *end || (value != 500 && value != 1000 && value != 2000)) return 2;
             interval_ms = static_cast<int>(value);
+        } else if (std::wcscmp(argv[i], L"--compact-interval-ms") == 0 && i + 1 < argc) {
+            wchar_t* end = nullptr;
+            const wchar_t* text = argv[++i];
+            const long value = std::wcstol(text, &end, 10);
+            if (end == text || *end || (value != 1000 && value != 2000 && value != 5000)) return 2;
+            compact_interval_ms = static_cast<int>(value);
         } else if (std::wcscmp(argv[i], L"--fps") == 0) fps_test = true;
         else if (std::wcscmp(argv[i], L"--switch-every") == 0 && i + 1 < argc) {
             wchar_t* end = nullptr;
@@ -611,7 +617,7 @@ int wmain(int argc, wchar_t** argv) {
             if (!end || *end || value < 1 || value > 86400) return 2;
             switch_every = static_cast<int>(value);
         } else {
-            std::wprintf(L"Usage: metrics_selftest.exe [--samples N] [--compact] [--brief] [--interval-ms 500|1000|2000] [--switch-every N] [--slow-ms 300|500|800] [--url URL ...] [--fps] [--gpu] [--nvml] [--power] [--no-probe] [--process-count-only]\n");
+            std::wprintf(L"Usage: metrics_selftest.exe [--samples N] [--compact] [--brief] [--interval-ms 500|1000|2000] [--compact-interval-ms 1000|2000|5000] [--switch-every N] [--slow-ms 300|500|800] [--url URL ...] [--fps] [--gpu] [--nvml] [--power] [--no-probe] [--process-count-only]\n");
             return 2;
         }
     }
@@ -657,8 +663,8 @@ int wmain(int argc, wchar_t** argv) {
         };
         pulse::PowerTrace trace = pulse::PowerTrace::Unknown;
         metrics.SetWants(wants_for(full, trace));
-        std::wprintf(L"mode=%ls samples=%d full_interval_ms=%d compact_interval_ms=2000 switch_every=%d log=%ls\n",
-            full ? L"full" : L"compact", samples, interval_ms, switch_every, metrics.LogPath().c_str());
+        std::wprintf(L"mode=%ls samples=%d full_interval_ms=%d compact_interval_ms=%d switch_every=%d log=%ls\n",
+            full ? L"full" : L"compact", samples, interval_ms, compact_interval_ms, switch_every, metrics.LogPath().c_str());
         std::wprintf(L"Energy raw: pWh; W = delta_pwh * 3.6e-9 / QPC_seconds. Compact/fallback: Power mW / 1000.\n");
         std::wprintf(L"CPU: Processor Utility (PDH, display clamped 0..100); GetSystemTimes prints the old Processor Time basis.\n"
                      L"cpu_from_utility=false means warmup/fallback; unknown first interval prints nan. Network slow_ms=%d.\n", settings.slow_ms);
@@ -666,7 +672,7 @@ int wmain(int argc, wchar_t** argv) {
         metrics.Start(settings, OnNet, nullptr);
         for (int i = 0; i < samples; ++i) {
             const bool detailed = switch_every && (i / switch_every) % 2 ? !full : full;
-            if (i > 0) Sleep(detailed ? static_cast<DWORD>(interval_ms) : 2000u);
+            if (i > 0) Sleep(static_cast<DWORD>(detailed ? interval_ms : compact_interval_ms));
             metrics.SetWants(wants_for(detailed, trace));
             const auto snapshot = metrics.Sample(detailed);
             // Next sample keeps the last confirmed source. Printing still uses

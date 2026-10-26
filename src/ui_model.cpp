@@ -107,33 +107,35 @@ std::wstring NetworkEventText(const NetEvent& event) {
 }
 
 void Components::Reset() {
+    compactOrder = DefaultCompactOrder;
+    taskbarOrder = DefaultTaskbarOrder;
     for (size_t i = 0; i < full.size(); ++i) full[i] = FullComponents[i].enabled;
     for (size_t i = 0; i < compact.size(); ++i) compact[i] = CompactComponents[i].enabled;
     for (size_t i = 0; i < taskbar.size(); ++i) taskbar[i] = TaskbarComponents[i].enabled;
 }
 Wants CollectionWants(const Components& components, DisplayMode display, bool details, PowerTrace trace) {
-    Components c = components;
+    const auto& selected = display == DisplayMode::Taskbar ? components.taskbar : components.compact;
+    const auto enabled = [&](CompactComponent c) { return selected[static_cast<std::size_t>(c)]; };
     const bool compact = display != DisplayMode::Full && !details;
-    if (display == DisplayMode::Taskbar) c.compact = c.taskbar;
     const bool package = NeedsPackagePower(trace);
     Wants w;
-    w.chip_power = compact ? c.Enabled(CompactComponent::Power) && package :
-        c.Enabled(FullComponent::Hardware) || (c.Enabled(FullComponent::PowerChart) && package);
-    w.gpu_usage = compact ? c.Enabled(CompactComponent::Gpu) : c.Enabled(FullComponent::Hardware);
-    w.dgpu_power = display == DisplayMode::Full && c.Enabled(FullComponent::Hardware);
-    w.processes = !compact && c.Enabled(FullComponent::Processes);
-    w.process_count = !compact && c.Enabled(FullComponent::SystemInfo);
-    w.power_scheme = !compact && c.Enabled(FullComponent::Battery);
-    w.memory_detail = !compact && c.Enabled(FullComponent::SystemInfo);
-    w.disk_io = compact ? c.Enabled(CompactComponent::DiskIO) : c.Enabled(FullComponent::DiskIO);
-    w.sys_disk = !compact && c.Enabled(FullComponent::SystemDisk);
-    w.cpu_freq = compact ? c.Enabled(CompactComponent::CpuFrequency) : c.Enabled(FullComponent::SystemInfo);
-    w.uptime = !compact && c.Enabled(FullComponent::SystemInfo);
-    w.gpu_memory = !compact && c.Enabled(FullComponent::GpuMemory);
-    w.gpu_temp = compact ? c.Enabled(CompactComponent::GpuTemp) : c.Enabled(FullComponent::GpuMemory);
-    w.wifi = !compact && c.Enabled(FullComponent::Wifi);
-    w.battery_health = !compact && c.Enabled(FullComponent::BatteryHealth);
-    w.fps = compact ? c.Enabled(CompactComponent::Fps) : c.Enabled(FullComponent::Fps);
+    w.chip_power = compact ? enabled(CompactComponent::Power) && package :
+        components.Enabled(FullComponent::Hardware) || (components.Enabled(FullComponent::PowerChart) && package);
+    w.gpu_usage = compact ? enabled(CompactComponent::Gpu) : components.Enabled(FullComponent::Hardware);
+    w.dgpu_power = display == DisplayMode::Full && components.Enabled(FullComponent::Hardware);
+    w.processes = !compact && components.Enabled(FullComponent::Processes);
+    w.process_count = !compact && components.Enabled(FullComponent::SystemInfo);
+    w.power_scheme = !compact && components.Enabled(FullComponent::Battery);
+    w.memory_detail = !compact && components.Enabled(FullComponent::SystemInfo);
+    w.disk_io = compact ? enabled(CompactComponent::DiskIO) : components.Enabled(FullComponent::DiskIO);
+    w.sys_disk = !compact && components.Enabled(FullComponent::SystemDisk);
+    w.cpu_freq = compact ? enabled(CompactComponent::CpuFrequency) : components.Enabled(FullComponent::SystemInfo);
+    w.uptime = !compact && components.Enabled(FullComponent::SystemInfo);
+    w.gpu_memory = !compact && components.Enabled(FullComponent::GpuMemory);
+    w.gpu_temp = compact ? enabled(CompactComponent::GpuTemp) : components.Enabled(FullComponent::GpuMemory);
+    w.wifi = !compact && components.Enabled(FullComponent::Wifi);
+    w.battery_health = !compact && components.Enabled(FullComponent::BatteryHealth);
+    w.fps = compact ? enabled(CompactComponent::Fps) : components.Enabled(FullComponent::Fps);
     if (display == DisplayMode::Taskbar && details) {
         const auto strip = CollectionWants(components, DisplayMode::Taskbar, false, trace);
         w.chip_power = w.chip_power || strip.chip_power;
@@ -524,7 +526,9 @@ bool Model::Update(const Snapshot& s, bool compact, const Components& c, bool ta
     const bool selectionChanged = compact_ != compact ||
         (compact ? components_.compact != c.compact : components_.full != c.full);
     const bool changed = !haveSample_ || historyBroken_ || selectionChanged || !v.Equals(view_, compact, c);
-    view_ = std::move(v); components_ = c; compact_ = compact;
+    view_ = std::move(v);
+    // History and change detection need selections only, never order or appearance.
+    components_.full = c.full; components_.compact = c.compact; compact_ = compact;
     haveSample_ = true; historyBroken_ = false;
     return changed;
 }

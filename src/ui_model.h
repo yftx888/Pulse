@@ -67,10 +67,24 @@ inline constexpr auto TaskbarComponents = [] {
         items[static_cast<std::size_t>(c)].enabled = true;
     return items;
 }();
+using ComponentOrder = std::array<CompactComponent, CompactComponents.size()>;
+inline constexpr ComponentOrder DefaultCompactOrder{{
+    CompactComponent::Battery, CompactComponent::Eta, CompactComponent::Power,
+    CompactComponent::Cpu, CompactComponent::Memory, CompactComponent::Gpu,
+    CompactComponent::Network, CompactComponent::Latency, CompactComponent::DiskIO,
+    CompactComponent::CpuFrequency, CompactComponent::Fps, CompactComponent::GpuTemp
+}};
+inline constexpr ComponentOrder DefaultTaskbarOrder{{
+    CompactComponent::Network, CompactComponent::Eta, CompactComponent::Power,
+    CompactComponent::Battery, CompactComponent::Cpu, CompactComponent::Memory,
+    CompactComponent::Gpu, CompactComponent::Latency, CompactComponent::CpuFrequency,
+    CompactComponent::Fps, CompactComponent::GpuTemp, CompactComponent::DiskIO
+}};
 struct Components {
     std::array<bool, FullComponents.size()> full{};
     std::array<bool, CompactComponents.size()> compact{};
     std::array<bool, CompactComponents.size()> taskbar{};
+    ComponentOrder compactOrder = DefaultCompactOrder, taskbarOrder = DefaultTaskbarOrder;
     Components() { Reset(); }
     void Reset();
     bool Enabled(FullComponent c) const { return full[static_cast<std::size_t>(c)]; }

@@ -4,6 +4,7 @@
 #include "metrics.h"
 #include "netprobe.h"
 #include <windowsx.h>
+#include <commdlg.h>
 #include <shellapi.h>
 #ifndef SEE_MASK_NOCLOSEPROCESS
 #define SEE_MASK_NOCLOSEPROCESS 0x00000040
@@ -60,6 +61,10 @@ constexpr UINT CmdRefresh = 400;
 constexpr UINT CmdSlowThreshold = 450;
 constexpr UINT CmdZoom = 500;
 constexpr UINT CmdLanguage = 600;
+constexpr UINT CmdMiniRefresh = 800, CmdMiniOpacity = 820;
+constexpr UINT CmdSelect = 840; // Full, Compact, Taskbar: all/none pairs.
+constexpr UINT CmdCompactColor = 900, CmdTaskbarColor = 920, CmdResetColors = 940;
+constexpr UINT CmdCompactMove = 1000, CmdTaskbarMove = 1100; // Four actions per component.
 constexpr std::array<i18n::Preference, 3> Languages{{
     i18n::Preference::Auto, i18n::Preference::Chinese, i18n::Preference::English}};
 constexpr std::array<UINT, 3> RefreshIntervals{{500u, 1000u, 2000u}};
@@ -90,13 +95,13 @@ void AlertSound(bool play) {
     sound(file.c_str(), nullptr, SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
 }
 
-void SetSampleTimer(HWND window, bool compact, UINT fullInterval) {
+void SetSampleTimer(HWND window, bool compact, UINT fullInterval, UINT miniInterval) {
     using CoalescableTimerFn = UINT_PTR(WINAPI*)(HWND, UINT_PTR, UINT, TIMERPROC, ULONG);
     static const auto coalescable = reinterpret_cast<CoalescableTimerFn>(
         GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetCoalescableTimer"));
-    const UINT interval = compact ? 2000u : fullInterval;
-    // Full mode prioritizes response time; keep compact mode's existing coalescing.
-    const ULONG tolerance = compact ? 300u : 0xffffffffu; // TIMERV_NO_COALESCING
+    const UINT interval = compact ? miniInterval : fullInterval;
+    // Full mode prioritizes response time; mini modes coalesce by their selected interval.
+    const ULONG tolerance = compact ? MiniTimerTolerance(miniInterval) : 0xffffffffu; // TIMERV_NO_COALESCING
     if (!coalescable || !coalescable(window, SampleTimer, interval, nullptr, tolerance))
         SetTimer(window, SampleTimer, interval, nullptr);
 }
@@ -292,7 +297,7 @@ HICON IconOrDefault(HICON icon) {
 
 struct Config {
     int x = INT_MIN, y = INT_MIN;
-    UINT refresh_ms = 1000;
+    UINT refresh_ms = 1000, mini_refresh_ms = 2000;
     int slow_ms = 500;
     int zoom = 100;
     i18n::Preference language = i18n::Preference::Auto;
@@ -303,6 +308,27 @@ struct Config {
     bool notify = true, notify_sound = true;
     std::wstring file;
     Components components;
+    MiniAppearance appearance;
+    void LoadMiniPreferences(const wchar_t* section, ComponentOrder& order, const ComponentOrder& defaults,
+                             TextColors& colors) {
+        wchar_t value[2048]{};
+        GetPrivateProfileStringW(section, L"order", L"", value, 2048, file.c_str());
+        order = ParseComponentOrder(value, defaults);
+        for (size_t i = 0; i < CompactComponents.size(); ++i) {
+            const auto key = std::wstring(L"color_") + CompactComponents[i].key;
+            GetPrivateProfileStringW(section, key.c_str(), L"", value, 2048, file.c_str());
+            colors[i] = ParseTextColor(value);
+        }
+    }
+    void SaveMiniPreferences(const wchar_t* section, const ComponentOrder& order, const TextColors& colors) const {
+        const auto value = FormatComponentOrder(order);
+        WritePrivateProfileStringW(section, L"order", value.c_str(), file.c_str());
+        for (size_t i = 0; i < CompactComponents.size(); ++i) {
+            const auto key = std::wstring(L"color_") + CompactComponents[i].key;
+            const auto color = FormatTextColor(colors[i]);
+            WritePrivateProfileStringW(section, key.c_str(), color.empty() ? nullptr : color.c_str(), file.c_str());
+        }
+    }
     bool ReadComponent(const wchar_t* section, const ComponentInfo& info) const {
         wchar_t value[16]{};
         GetPrivateProfileStringW(section, info.key, L"", value, 16, file.c_str());
@@ -346,6 +372,13 @@ struct Config {
             static_cast<int>(zoomPercent) : 100;
         const UINT interval = GetPrivateProfileIntW(L"Window", L"refresh_ms", 1000, file.c_str());
         refresh_ms = std::find(RefreshIntervals.begin(), RefreshIntervals.end(), interval) != RefreshIntervals.end() ? interval : 1000u;
+        wchar_t mini[32]{};
+        GetPrivateProfileStringW(L"Window", L"mini_refresh_ms", L"2000", mini, 32, file.c_str());
+        mini_refresh_ms = ParseMiniRefresh(mini);
+        GetPrivateProfileStringW(L"Compact", L"opacity", L"100", mini, 32, file.c_str());
+        appearance.opacity = ParseMiniOpacity(mini);
+        LoadMiniPreferences(L"Compact", components.compactOrder, DefaultCompactOrder, appearance.compact);
+        LoadMiniPreferences(L"Taskbar", components.taskbarOrder, DefaultTaskbarOrder, appearance.taskbar);
         wchar_t slow[32]{};
         GetPrivateProfileStringW(L"Network", L"slow_ms", L"500", slow, 32, file.c_str());
         slow_ms = 500;
@@ -379,6 +412,12 @@ struct Config {
         WritePrivateProfileStringW(L"Window", L"zoom", zoomValue.c_str(), file.c_str());
         const auto interval = std::to_wstring(refresh_ms);
         WritePrivateProfileStringW(L"Window", L"refresh_ms", interval.c_str(), file.c_str());
+        const auto miniInterval = std::to_wstring(mini_refresh_ms);
+        WritePrivateProfileStringW(L"Window", L"mini_refresh_ms", miniInterval.c_str(), file.c_str());
+        const auto opacity = std::to_wstring(appearance.opacity);
+        WritePrivateProfileStringW(L"Compact", L"opacity", opacity.c_str(), file.c_str());
+        SaveMiniPreferences(L"Compact", components.compactOrder, appearance.compact);
+        SaveMiniPreferences(L"Taskbar", components.taskbarOrder, appearance.taskbar);
         const auto slow = std::to_wstring(slow_ms);
         WritePrivateProfileStringW(L"Network", L"slow_ms", slow.c_str(), file.c_str());
         WritePrivateProfileStringW(L"Network", L"notify", notify ? L"1" : L"0", file.c_str());
@@ -631,6 +670,8 @@ public:
         renderer_.SetSoftware(config_.mode != DisplayMode::Full);
         renderer_.SetZoom(config_.zoom);
         renderer_.SetComponents(config_.components, Compact());
+        renderer_.SetTextColors(config_.appearance.compact);
+        taskbar_.SetTextColors(config_.appearance.taskbar);
         model_.Update(Snapshot{}, Compact(), config_.components);
         renderer_.SetCompactEtaVisible(model_.Data().compactEtaVisible);
         const auto size = FittedSize(work);
@@ -713,6 +754,31 @@ private:
     bool Compact() const { return config_.mode == DisplayMode::Compact || taskbarFallback_; }
     DisplayMode CollectionMode() const { return taskbarFallback_ ? DisplayMode::Compact : config_.mode; }
     bool Cheap() const { return config_.mode != DisplayMode::Full && !details_; }
+    void ApplyCompactOpacity() {
+        if (!window_) return;
+        const bool layered = Compact() && config_.appearance.opacity < 100;
+        const LONG_PTR style = GetWindowLongPtrW(window_, GWL_EXSTYLE);
+        const bool changed = ((style & WS_EX_LAYERED) != 0) != layered;
+        if (changed) {
+            // Discard before changing presentation style, especially before Full's hardware target.
+            renderer_.DiscardTarget();
+            SetWindowLongPtrW(window_, GWL_EXSTYLE, layered ? style | WS_EX_LAYERED : style & ~LONG_PTR(WS_EX_LAYERED));
+        }
+        if (layered) {
+            const BYTE alpha = static_cast<BYTE>((config_.appearance.opacity * 255 + 50) / 100);
+            SetLayeredWindowAttributes(window_, 0, alpha, LWA_ALPHA);
+        }
+        if (changed) {
+            const bool fitting = std::exchange(fitting_, true);
+            SetWindowPos(window_, nullptr, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+            fitting_ = fitting;
+        }
+        if (changed || layered) {
+            repaintPending_ = true;
+            RedrawWindow(window_, nullptr, nullptr, RDW_INVALIDATE | RDW_FRAME);
+        }
+    }
     void ConfigureTaskbar() {
         taskbar_.Configure(config_.components, config_.zoom, config_.taskbarPosition, config_.widgetsWidth);
     }
@@ -752,6 +818,7 @@ private:
     void ToggleDetails() {
         if (!TaskbarMode()) return;
         details_ = !details_;
+        ApplyCompactOpacity();
         renderer_.SetTaskbarDetails(details_);
         if (!details_) {
             ShowWindow(window_, SW_HIDE);
@@ -770,6 +837,7 @@ private:
         if (taskbarFallback_ == fallback) return;
         CapturePosition();
         taskbarFallback_ = fallback;
+        ApplyCompactOpacity();
         details_ = false;
         renderer_.SetTaskbarDetails(false);
         renderer_.SetSoftware(true);
@@ -933,10 +1001,11 @@ private:
             return;
         }
         if (changed) model_.BreakHistory();
-        if (changed || resetTimer) SetSampleTimer(window_, Cheap(), config_.refresh_ms);
+        if (changed || resetTimer) SetSampleTimer(window_, Cheap(), config_.refresh_ms, config_.mini_refresh_ms);
         if (sampleNow || changed) Refresh();
     }
     void Reconfigure(bool resetHistory, bool visibleChanged = true) {
+        ApplyCompactOpacity();
         UpdateCollection();
         ConfigureTaskbar();
         if (!visibleChanged) { Save(); return; }
@@ -998,6 +1067,7 @@ private:
             ConfigureTaskbar();
             TrackTaskbar(true);
         }
+        ApplyCompactOpacity();
         renderer_.SetSoftware(config_.mode != DisplayMode::Full);
         Reconfigure(true);
         if (!TaskbarMode()) {
@@ -1183,6 +1253,119 @@ private:
         if (info.hProcess) CloseHandle(info.hProcess);
         SendMessageW(window_, WM_CLOSE, 0, 0);
     }
+    void AppendSelectionMenu(HMENU menu, UINT mode) {
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, CmdSelect + 2 * mode, T(Key::SelectAll).c_str());
+        AppendMenuW(menu, MF_STRING, CmdSelect + 2 * mode + 1, T(Key::SelectNone).c_str());
+    }
+    void AppendMiniMenu(HMENU menu, bool taskbar) {
+        const auto& enabled = taskbar ? config_.components.taskbar : config_.components.compact;
+        const auto& order = taskbar ? config_.components.taskbarOrder : config_.components.compactOrder;
+        const auto& colors = taskbar ? config_.appearance.taskbar : config_.appearance.compact;
+        const UINT componentBase = taskbar ? CmdTaskbarComponent : CmdCompactComponent;
+        const UINT colorBase = taskbar ? CmdTaskbarColor : CmdCompactColor;
+        const UINT moveBase = taskbar ? CmdTaskbarMove : CmdCompactMove;
+        for (auto c : order) {
+            const auto i = static_cast<size_t>(c);
+            AppendMenuW(menu, MF_STRING | (enabled[i] ? MF_CHECKED : 0), componentBase + static_cast<UINT>(i),
+                T(CompactComponents[i].label).c_str());
+        }
+        AppendSelectionMenu(menu, taskbar ? 2u : 1u);
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        HMENU reorder = CreatePopupMenu();
+        if (reorder) {
+            const Key labels[] = {Key::MoveUp, Key::MoveDown, Key::MoveFirst, Key::MoveLast};
+            for (auto c : order) {
+                const auto i = static_cast<size_t>(c);
+                if (!enabled[i]) continue;
+                HMENU actions = CreatePopupMenu();
+                if (!actions) continue;
+                const bool up = CanMoveComponent(order, enabled, c, true);
+                const bool down = CanMoveComponent(order, enabled, c, false);
+                for (UINT action = 0; action < 4; ++action)
+                    AppendMenuW(actions, MF_STRING | ((action == 0 || action == 2 ? up : down) ? 0 : MF_GRAYED),
+                        moveBase + static_cast<UINT>(i) * 4 + action, T(labels[action]).c_str());
+                if (!AppendMenuW(reorder, MF_POPUP, reinterpret_cast<UINT_PTR>(actions), T(CompactComponents[i].label).c_str()))
+                    DestroyMenu(actions);
+            }
+            if (!AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(reorder), T(Key::Reorder).c_str()))
+                DestroyMenu(reorder);
+        }
+        HMENU color = CreatePopupMenu();
+        if (color) {
+            bool any = false;
+            for (auto c : order) {
+                const auto i = static_cast<size_t>(c);
+                if (!enabled[i]) continue;
+                AppendMenuW(color, MF_STRING | (colors[i] ? MF_CHECKED : 0), colorBase + static_cast<UINT>(i),
+                    T(CompactComponents[i].label).c_str());
+                any = true;
+            }
+            if (any) AppendMenuW(color, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(color, MF_STRING, CmdResetColors + (taskbar ? 1u : 0u), T(Key::ResetColors).c_str());
+            if (!AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(color), T(Key::TextColor).c_str()))
+                DestroyMenu(color);
+        }
+    }
+    static UINT_PTR CALLBACK ColorDialogHook(HWND dialog, UINT message, WPARAM, LPARAM) {
+        if (message == WM_INITDIALOG) {
+            // The owner can be hidden in taskbar mode; activate the visible dialog itself.
+            SetWindowPos(dialog, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+            SetForegroundWindow(dialog);
+        }
+        return 0;
+    }
+    void ColorsChanged(bool taskbar) {
+        if (taskbar) {
+            taskbar_.SetTextColors(config_.appearance.taskbar);
+            taskbar_.Redraw();
+        } else {
+            renderer_.SetTextColors(config_.appearance.compact);
+            if (Compact()) {
+                repaintPending_ = true;
+                InvalidateRect(window_, nullptr, FALSE);
+            }
+        }
+        Save();
+    }
+    void ChooseTextColor(bool taskbar, CompactComponent component) {
+        const auto i = static_cast<size_t>(component);
+        const auto& enabled = taskbar ? config_.components.taskbar : config_.components.compact;
+        if (!enabled[i]) return;
+        auto& colors = taskbar ? config_.appearance.taskbar : config_.appearance.compact;
+        COLORREF initial = 0;
+        if (colors[i]) {
+            const auto rgb = *colors[i];
+            initial = RGB((rgb >> 16) & 255u, (rgb >> 8) & 255u, rgb & 255u);
+        } else {
+            Components selection = config_.components;
+            if (taskbar) selection.compact = selection.taskbar;
+            Model preview;
+            preview.Update(latest_, true, selection, taskbar);
+            initial = taskbar ? taskbar_.DefaultValueColor(component, preview.Data()) :
+                renderer_.DefaultValueColor(component, preview.Data());
+        }
+        const HMODULE module = LoadLibraryExW(L"comdlg32.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (!module) return;
+        using ChooseFn = BOOL(WINAPI*)(LPCHOOSECOLORW);
+        const auto choose = reinterpret_cast<ChooseFn>(GetProcAddress(module, "ChooseColorW"));
+        static COLORREF custom[16]{}; // Process lifetime only; no disk writes.
+        CHOOSECOLORW choice{};
+        choice.lStructSize = sizeof(choice);
+        choice.hwndOwner = window_;
+        choice.rgbResult = initial;
+        choice.lpCustColors = custom;
+        choice.Flags = CC_RGBINIT | CC_FULLOPEN | CC_ANYCOLOR | CC_ENABLEHOOK;
+        choice.lpfnHook = ColorDialogHook;
+        const bool accepted = choose && choose(&choice);
+        FreeLibrary(module);
+        if (!accepted) return;
+        const auto rgb = (static_cast<std::uint32_t>(GetRValue(choice.rgbResult)) << 16) |
+            (static_cast<std::uint32_t>(GetGValue(choice.rgbResult)) << 8) | GetBValue(choice.rgbResult);
+        if (colors[i] == rgb) return;
+        colors[i] = rgb;
+        ColorsChanged(taskbar);
+    }
     void Menu(POINT point) {
         HMENU menu = CreatePopupMenu();
         if (!menu) return;
@@ -1232,12 +1415,45 @@ private:
                 i18n::Format(Key::CustomSize, {std::to_wstring(config_.zoom)}) : T(Key::Size);
             AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(zoom), label.c_str());
         }
+        HMENU opacity = CreatePopupMenu();
+        if (opacity) {
+            UINT selected = CmdMiniOpacity;
+            for (size_t i = 0; i < MiniOpacities.size(); ++i) {
+                auto label = std::to_wstring(MiniOpacities[i]) + L"%";
+                if (MiniOpacities[i] == 100) label += T(Key::DefaultSuffix);
+                const UINT id = CmdMiniOpacity + static_cast<UINT>(i);
+                AppendMenuW(opacity, MF_STRING, id, label.c_str());
+                if (config_.appearance.opacity == MiniOpacities[i]) selected = id;
+            }
+            CheckMenuRadioItem(opacity, CmdMiniOpacity, CmdMiniOpacity + static_cast<UINT>(MiniOpacities.size()) - 1,
+                selected, MF_BYCOMMAND);
+            AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(opacity), T(Key::MiniOpacity).c_str());
+        }
         HMENU refresh = CreatePopupMenu();
         if (refresh) {
-            const wchar_t* labels[] = {T(Key::RefreshHalf).c_str(), T(Key::RefreshOne).c_str(), T(Key::RefreshTwo).c_str()};
-            for (size_t i = 0; i < RefreshIntervals.size(); ++i)
-                AppendMenuW(refresh, MF_STRING | (config_.refresh_ms == RefreshIntervals[i] ? MF_CHECKED : 0),
-                            CmdRefresh + static_cast<UINT>(i), labels[i]);
+            AppendMenuW(refresh, MF_STRING | MF_GRAYED, 0, T(Key::FullMode).c_str());
+            const Key fullLabels[] = {Key::RefreshHalf, Key::RefreshOne, Key::RefreshTwo};
+            UINT selectedFull = CmdRefresh + 1;
+            for (size_t i = 0; i < RefreshIntervals.size(); ++i) {
+                const UINT id = CmdRefresh + static_cast<UINT>(i);
+                AppendMenuW(refresh, MF_STRING, id, T(fullLabels[i]).c_str());
+                if (config_.refresh_ms == RefreshIntervals[i]) selectedFull = id;
+            }
+            CheckMenuRadioItem(refresh, CmdRefresh, CmdRefresh + static_cast<UINT>(RefreshIntervals.size()) - 1,
+                selectedFull, MF_BYCOMMAND);
+            AppendMenuW(refresh, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(refresh, MF_STRING | MF_GRAYED, 0, T(Key::MiniTaskbar).c_str());
+            const Key miniLabels[] = {Key::RefreshOnePlain, Key::RefreshTwo, Key::RefreshFive};
+            UINT selectedMini = CmdMiniRefresh + 1;
+            for (size_t i = 0; i < MiniRefreshIntervals.size(); ++i) {
+                auto label = T(miniLabels[i]);
+                if (MiniRefreshIntervals[i] == 2000u) label += T(Key::DefaultSuffix);
+                const UINT id = CmdMiniRefresh + static_cast<UINT>(i);
+                AppendMenuW(refresh, MF_STRING, id, label.c_str());
+                if (config_.mini_refresh_ms == MiniRefreshIntervals[i]) selectedMini = id;
+            }
+            CheckMenuRadioItem(refresh, CmdMiniRefresh, CmdMiniRefresh + static_cast<UINT>(MiniRefreshIntervals.size()) - 1,
+                selectedMini, MF_BYCOMMAND);
             AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(refresh), T(Key::RefreshInterval).c_str());
         }
         HMENU slow = CreatePopupMenu();
@@ -1266,12 +1482,9 @@ private:
             for (size_t i = 0; i < FullComponents.size(); ++i)
                 AppendMenuW(full, MF_STRING | (config_.components.full[i] ? MF_CHECKED : 0),
                             CmdFullComponent + static_cast<UINT>(i), T(FullComponents[i].label).c_str());
-            for (size_t i = 0; i < CompactComponents.size(); ++i)
-                AppendMenuW(compact, MF_STRING | (config_.components.compact[i] ? MF_CHECKED : 0),
-                            CmdCompactComponent + static_cast<UINT>(i), T(CompactComponents[i].label).c_str());
-            for (size_t i = 0; i < TaskbarComponents.size(); ++i)
-                AppendMenuW(taskbar, MF_STRING | (config_.components.taskbar[i] ? MF_CHECKED : 0),
-                    CmdTaskbarComponent + static_cast<UINT>(i), T(TaskbarComponents[i].label).c_str());
+            AppendSelectionMenu(full, 0);
+            AppendMiniMenu(compact, false);
+            AppendMiniMenu(taskbar, true);
             AppendMenuW(contents, MF_POPUP, reinterpret_cast<UINT_PTR>(taskbar), T(Key::TaskbarMode).c_str());
             AppendMenuW(contents, MF_POPUP, reinterpret_cast<UINT_PTR>(full), T(Key::FullMode).c_str());
             AppendMenuW(contents, MF_POPUP, reinterpret_cast<UINT_PTR>(compact), T(Key::MiniMode).c_str());
@@ -1308,6 +1521,57 @@ private:
         if (command) Command(command);
     }
     void Command(UINT command) {
+        if (command >= CmdMiniRefresh && command < CmdMiniRefresh + static_cast<UINT>(MiniRefreshIntervals.size())) {
+            config_.mini_refresh_ms = MiniRefreshIntervals[command - CmdMiniRefresh];
+            if (Cheap()) Sampling(false, true);
+            Save();
+            return;
+        }
+        if (command >= CmdMiniOpacity && command < CmdMiniOpacity + static_cast<UINT>(MiniOpacities.size())) {
+            config_.appearance.opacity = MiniOpacities[command - CmdMiniOpacity];
+            ApplyCompactOpacity();
+            Save();
+            return;
+        }
+        if (command >= CmdSelect && command < CmdSelect + 6) {
+            const UINT mode = (command - CmdSelect) / 2;
+            const bool enabled = (command - CmdSelect) % 2 == 0;
+            if (mode == 0) SelectComponents(config_.components.full, enabled);
+            else if (mode == 1) SelectComponents(config_.components.compact, enabled);
+            else SelectComponents(config_.components.taskbar, enabled);
+            const bool visible = mode == 0 ? !Compact() && (!TaskbarMode() || details_) :
+                mode == 1 ? Compact() : config_.mode == DisplayMode::Taskbar;
+            Reconfigure(false, visible);
+            return;
+        }
+        const UINT colorCount = static_cast<UINT>(CompactComponents.size());
+        if (command >= CmdCompactColor && command < CmdCompactColor + colorCount) {
+            ChooseTextColor(false, static_cast<CompactComponent>(command - CmdCompactColor));
+            return;
+        }
+        if (command >= CmdTaskbarColor && command < CmdTaskbarColor + colorCount) {
+            ChooseTextColor(true, static_cast<CompactComponent>(command - CmdTaskbarColor));
+            return;
+        }
+        if (command == CmdResetColors || command == CmdResetColors + 1) {
+            const bool taskbar = command != CmdResetColors;
+            (taskbar ? config_.appearance.taskbar : config_.appearance.compact).fill(std::nullopt);
+            ColorsChanged(taskbar);
+            return;
+        }
+        const UINT moveCount = colorCount * 4;
+        const bool compactMove = command >= CmdCompactMove && command < CmdCompactMove + moveCount;
+        const bool taskbarMove = command >= CmdTaskbarMove && command < CmdTaskbarMove + moveCount;
+        if (compactMove || taskbarMove) {
+            const UINT action = command - (taskbarMove ? CmdTaskbarMove : CmdCompactMove);
+            const auto component = static_cast<CompactComponent>(action / 4);
+            const ComponentMove moves[] = {ComponentMove::Up, ComponentMove::Down, ComponentMove::First, ComponentMove::Last};
+            auto& order = taskbarMove ? config_.components.taskbarOrder : config_.components.compactOrder;
+            const auto& enabled = taskbarMove ? config_.components.taskbar : config_.components.compact;
+            if (MoveComponent(order, enabled, component, moves[action % 4]))
+                Reconfigure(false, taskbarMove ? config_.mode == DisplayMode::Taskbar : Compact());
+            return;
+        }
         if (command >= CmdTaskbarPosition && command < CmdTaskbarPosition + 3) {
             config_.taskbarPosition = static_cast<TaskbarPosition>(command - CmdTaskbarPosition);
             ConfigureTaskbar();
@@ -1458,6 +1722,7 @@ private:
             UpdateIcons();
             renderer_.SetWindow(window_, dpi_);
             StyleWindow(window_);
+            ApplyCompactOpacity();
             return 0;
         case WM_NCCALCSIZE: return 0;
         case WM_NCHITTEST: return HTCLIENT;

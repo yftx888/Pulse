@@ -210,6 +210,9 @@ enum class Key : std::size_t {
     PowerDiagnosticsLaunchFailed,
     DgpuPrefix,
     DgpuSleeping,
+    MiniTaskbar, RefreshOnePlain, RefreshFive, MiniOpacity,
+    SelectAll, SelectNone, TextColor, ResetColors, Reorder,
+    MoveUp, MoveDown, MoveFirst, MoveLast,
     Count
 };
 namespace detail {

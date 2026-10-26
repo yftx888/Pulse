@@ -16,6 +16,9 @@ public:
     bool Open(HINSTANCE instance, HWND owner);
     void Close(); // Restores the classic task-button area before destroying the child.
     void Configure(const Components& components, int zoom, TaskbarPosition position, int widgetsWidth);
+    void SetTextColors(const TextColors& colors);
+    COLORREF DefaultValueColor(CompactComponent component, const View& view) const;
+    void Redraw(); // Appearance changes retain model, collection and text layouts.
     void ThemeChanged();
     void LanguageChanged();
     bool Update(const Snapshot& snapshot); // Tracks position and paints only when dirty.
