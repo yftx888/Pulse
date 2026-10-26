@@ -211,6 +211,20 @@ const Entry strings[] = {
     {L"GPU 温度", L"GPU temp"}, // GpuTemp
     {L"温度", L"Temp"}, // Temperature
     {L"GPU°", L"GPU°"}, // TaskbarGpuTemp
+    {L"电源计划 · ", L"Power plan · "}, // PowerPlanPrefix
+    {L"未知", L"Unknown"}, // PowerPlanUnknown
+    {L"插电放电", L"AC + battery"}, // AssistChip
+    {L"外接电源 · 电池放电", L"External power · Battery discharging"}, // ExternalDischarge
+    {L"净放电", L"Net discharge"}, // NetDischarge
+    {L"节电", L"Saver"}, // BatterySaverShort
+    {L"采样中", L"Sampling"}, // MeterWarmup
+    {L"无计数器", L"No counter"}, // MeterNoCounter
+    {L"无此域", L"No domain"}, // MeterNoDomain
+    {L"读取失败", L"Read failed"}, // MeterReadFailed
+    {L"功耗诊断", L"Power diagnostics"}, // PowerDiagnostics
+    {L"无法写入功耗诊断：{0}", L"Could not write the power diagnostic: {0}"}, // PowerDiagnosticsFailed
+    {L"诊断已写入，但无法打开文件：{0}", L"The diagnostic was written, but the file could not be opened: {0}"}, // PowerDiagnosticsOpenFailed
+    {L"无法启动功耗诊断（错误码：{0}）。", L"Could not start power diagnostics (error {0})."}, // PowerDiagnosticsLaunchFailed
 };
 static_assert(sizeof(strings) / sizeof(strings[0]) == static_cast<std::size_t>(Key::Count), "i18n table size");
 Language current = Language::English;

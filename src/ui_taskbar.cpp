@@ -291,7 +291,8 @@ struct TaskbarStrip::Impl {
             fit(L"999" + T(Key::MsSuffix)); fit(T(Key::UnknownLatency));
             fit(T(Key::Checking)); fit(T(Key::Offline)); break;
         case CompactComponent::Eta:
-            fit(L"88:88"); fit(L"59" + T(Key::MinuteSuffix)); fit(L"99+" + T(Key::HourSuffix)); break;
+            fit(L"88:88"); fit(L"59" + T(Key::MinuteSuffix)); fit(L"99+" + T(Key::HourSuffix));
+            fit(T(Key::AssistChip)); break;
         case CompactComponent::CpuFrequency: fit(L"10.00" + T(Key::GhzSuffix)); break;
         case CompactComponent::Fps: fit(L"8888"); fit(T(Key::RunAsAdmin)); break;
         case CompactComponent::GpuTemp: fit(L"150°C"); break;
@@ -302,6 +303,10 @@ struct TaskbarStrip::Impl {
     float LabelWidth(CompactComponent c) {
         float result = Measure(T(Label(c)));
         if (c == CompactComponent::Eta) result = std::max(result, Measure(T(Key::TaskbarFull)));
+        if (c == CompactComponent::Power) {
+            for (Key key : {Key::System, Key::CompactProcessor, Key::Battery, Key::Power})
+                result = std::max(result, Measure(T(key)));
+        }
         return std::ceil(result) + LabelGap;
     }
     float CellWidth(CompactComponent c) {
@@ -310,7 +315,7 @@ struct TaskbarStrip::Impl {
             // Like compact mode, idle status text uses the whole cell without a
             // label. Reserve it now so AC/charge/discharge never resize the strip.
             result = std::max(result, std::ceil(std::max(Measure(T(Key::FullyCharged)),
-                Measure(T(Key::NotCharging)))) + 1);
+                std::max(Measure(T(Key::NotCharging)), Measure(T(Key::AssistChip))))) + 1);
         }
         return result;
     }
@@ -541,13 +546,17 @@ struct TaskbarStrip::Impl {
                 switch (c) {
                 case CompactComponent::Battery:
                     value = v.percent + L"%";
-                    ink = v.mode == PowerMode::Charging || v.mode == PowerMode::AcIdle ? green : v.battery >= 0 && v.battery <= .2f ? red : normal; break;
+                    ink = v.supplemental ? yellow : v.mode == PowerMode::Charging || (v.mode == PowerMode::AcIdle && v.acOnline) ? green :
+                        v.battery >= 0 && v.battery <= .2f ? red : normal; break;
                 case CompactComponent::Eta:
                     value = !v.compactEtaVisible || v.compactEtaValue.empty() ? L"--" : v.compactEtaValue;
                     if (v.compactEtaVisible && v.compactEtaLabel.empty()) label.clear();
-                    ink = v.mode == PowerMode::Charging ? green : normal;
+                    ink = v.supplemental ? yellow : v.mode == PowerMode::Charging ? green : normal;
                     break;
-                case CompactComponent::Power: value = v.powerValue + T(Key::WattSuffix); ink = v.low ? red : v.mode == PowerMode::Charging ? green : yellow; break;
+                case CompactComponent::Power:
+                    if (!v.powerLabel.empty()) label = v.powerLabel;
+                    value = v.powerValue + T(Key::WattSuffix);
+                    ink = v.low ? red : v.mode == PowerMode::Charging ? green : yellow; break;
                 case CompactComponent::Cpu: value = v.cpuValue; ink = down; break;
                 case CompactComponent::Memory: value = v.memoryValue; ink = up; break;
                 case CompactComponent::Gpu: value = v.gpuUsage; ink = green; break;

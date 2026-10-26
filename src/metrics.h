@@ -2,6 +2,7 @@
 // 后端（metrics.cpp / netprobe.cpp，由 Grok 实现）只负责采样，界面（Codex 实现）只读 Snapshot。
 // 约定：数值未知时用 NaN（double）或 -1（整数），界面显示 "--"。
 #pragma once
+#include "power_state.h"
 #include <cmath>
 #include <cstdint>
 #include <string>
@@ -9,7 +10,6 @@
 
 namespace pulse {
 
-enum class PowerMode { Unknown, NoBattery, Discharging, Charging, AcIdle };   // AcIdle = 插着电但未充放电（已充满等）
 enum class NetState { Checking, Online, Slow, Offline };
 
 struct ProcUsage {
@@ -96,6 +96,28 @@ struct Snapshot {
     OfflineReason offline_reason = OfflineReason::None;
     double offline_latency_ms = NAN;
     double gpu_temp_c = NAN;   // 显卡温度（°C），同任务管理器口径（D3DKMT 适配器性能数据）；多块显卡取最高；不支持/显卡休眠/未启用为 NaN
+
+    // Appended fields. power_scheme / power_scheme_kind stay the overlay, not the plan.
+    // Active Control Panel plan. Invalid or empty after a failed query; custom names are not translated.
+    bool active_plan_valid = false;
+    std::wstring active_plan_name;
+
+    // External power and the signed battery rate. An unknown rate is never stored as 0 W.
+    bool ac_known = false;
+    bool ac_online = false;
+    bool battery_rate_valid = false;
+    double battery_rate_mw = NAN;          // Positive charges, negative discharges.
+    bool battery_supplemental = false;     // AC online while the battery is discharging.
+    bool power_contested = false;
+    PowerTrace power_trace = PowerTrace::Unknown;
+
+    // pkg / cpu (pp0) / graphics (pp1) / memory (dram). Not a sticky hardware absence.
+    MeterStatus pkg_meter = MeterStatus::Off;
+    MeterStatus cpu_meter = MeterStatus::Off;
+    MeterStatus gpu_meter = MeterStatus::Off;
+    MeterStatus mem_meter = MeterStatus::Off;
+
+    bool active_plan_balanced = false; // Confirmed system Balanced plan GUID, not its display name.
 };
 
 // 网络探测事件（断网 / 恢复），由后端在探测线程里回调；界面负责弹提醒卡片、播放提示音。
@@ -169,5 +191,14 @@ private:
     struct Impl;
     Impl* impl_;
 };
+
+// Manual power diagnostic shared by metrics_selftest --power and Pulse.exe --power-diagnostics.
+// It does not start network probes, the UI sampler, settings writes, or a resident thread.
+// The report blocks for about one second so two Energy samples can be compared.
+std::wstring BuildPowerDiagnosticsReport();
+
+// Writes a UTF-8 BOM text file. path_out receives the path on success.
+// Returns 0 when the file is written. error_out receives a short reason otherwise.
+int WritePowerDiagnosticsFile(std::wstring* path_out, std::wstring* error_out);
 
 }  // namespace pulse

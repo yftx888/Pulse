@@ -533,7 +533,7 @@ void Renderer::Full(const View& v, bool pinned, Button hover, Button pressed) {
             const std::wstring labels[] = {T(Key::Cpu), T(Key::Gpu), T(Key::Memory), T(Key::Processor)};
             const std::wstring values[] = {v.cpuValue, v.gpuUsage, v.memoryValue,
                                           v.packageW == L"--" ? L"--" : v.packageW + T(Key::WattSuffix)};
-            const std::wstring watts[] = {v.cpuW, v.gpuW, v.memW};
+            const std::wstring details[] = {v.cpuW, v.gpuW, v.memW, v.packageNote};
             for (int i = 0; i < 4; ++i) {
                 const float x = 25 + i * quarter;
                 if (i) Line(x - 5, h + 14, x - 5, h + 82, Border);
@@ -543,28 +543,38 @@ void Renderer::Full(const View& v, bool pinned, Button hover, Button pressed) {
                 const float width = Measure(values[i], size, true, true);
                 if (width > inner - 1) size *= (inner - 1) / width;
                 Text(values[i], Rect(x, h + 27, inner, 29), size, TextColor, true, true);
-                const std::wstring detail = i == 3 ? T(Key::WholeChip) :
-                    watts[i] == L"--" ? L"--" : watts[i] + T(Key::WattSuffix);
-                Text(detail, Rect(x, h + 58, inner, 16), 10.5f, Muted, false, i != 3);
+                Text(details[i], Rect(x, h + 58, inner, 16), 10.5f, Muted, false, i != 3);
             }
             Bar(Rect(25, h + 81, inner, 3), v.cpu, Down, Color(0x22d3ee));
             Bar(Rect(25 + quarter, h + 81, inner, 3), v.gpu, Charge, Color(0x10b981));
             Bar(Rect(25 + quarter * 2, h + 81, inner, 3), v.memory, Up, Color(0xf0abfc));
-
             break;
         }
         case FullComponent::Battery: {
             Panel(card);
             const float b = card.top;
-            const float chipWidth = Measure(v.chip, 11) + 16;
+            const float saverWidth = v.saverLabel.empty() ? 0.0f : Measure(v.saverLabel, 11) + 8;
+            const float chipTextWidth = Measure(v.chip, 11);
+            // Fit common modes and the saver tag inside the HEAD header width.
+            const float squeeze = std::clamp((chipTextWidth + 24 + fullSchemeWidth_ + saverWidth - content) / 24,
+                                            0.0f, 1.0f);
+            const float chipPadding = 16 * (1 - squeeze), chipGap = 8 * (1 - squeeze);
+            const float chipWidth = chipTextWidth + chipPadding;
             Rounded(Rect(25, b + 10, chipWidth, 18), 9, Alpha(accent, .14f));
             brush_->SetColor(Alpha(accent, .28f));
             target_->DrawRoundedRectangle(D2D1::RoundedRect(Rect(25, b + 10, chipWidth, 18), 9, 9), brush_.Get(), 1);
-            Text(v.chip, Rect(33, b + 10, chipWidth - 16, 18), 11, accent);
-            Text(v.scheme, Rect(25 + chipWidth + 8, b + 10, content - chipWidth - 8, 18), 11, Faint, false, false, true);
+            Text(v.chip, Rect(25 + chipPadding / 2, b + 10, chipTextWidth, 18), 11, accent);
+            if (saverWidth > 0)
+                Text(v.saverLabel, Rect(right - saverWidth, b + 10, saverWidth, 18), 11, accent, false, false, true);
+            const float schemeWidth = std::max(0.0f, content - chipWidth - chipGap - saverWidth);
+            Text(v.scheme, Rect(25 + chipWidth + chipGap, b + 10, schemeWidth, 18), 11, Faint, false, false, true);
             Ring(v, 25, b + 38);
             Text(v.etaLabel, Rect(113, b + 36, right - 113, 16), 11, Muted);
-            if (!v.heroWord.empty()) Text(v.heroWord, Rect(113, b + 53, right - 113, 31), 19, TextColor, true);
+            if (!v.heroWord.empty()) {
+                // Supplemental-power wording must fit the existing card, not widen all windows.
+                Text(v.heroWord, Rect(113, b + 53, right - 113, 31),
+                     v.supplemental ? 11.5f : 19.0f, TextColor, true, false, false, v.supplemental);
+            }
             else {
                 float x = 113;
                 for (const auto& part : v.hero) {
@@ -598,7 +608,7 @@ void Renderer::Full(const View& v, bool pinned, Button hover, Button pressed) {
             float maximum = 5;
             for (float value : v.powerHistory) maximum = std::max(maximum, value);
             Chart(chart, v.powerHistory.data(), v.powerHistory.size(),
-                  v.mode == PowerMode::Discharging ? Drain : Ac, maximum * 1.15f);
+                  v.powerTrace == PowerTrace::BatteryWhole ? Drain : Ac, maximum * 1.15f);
             break;
         }
         case FullComponent::Network: {
@@ -735,19 +745,34 @@ void Renderer::UpdateFullLayout() {
     systemLabelWidth_ = 84;
     for (Key key : {Key::CpuFrequency, Key::MemoryUsedTotal, Key::ProcessCount, Key::Uptime})
         systemLabelWidth_ = std::max(systemLabelWidth_, Measure(T(key), 11) + 12);
-    float chip = 0, scheme = Measure(T(Key::BatterySaver), 11);
+    float legacyChip = 0, legacyScheme = Measure(T(Key::BatterySaver), 11);
+    float scheme = Measure(T(Key::PowerPlanPrefix) + T(Key::PowerPlanUnknown), 11);
+    for (Key key : {Key::Balanced, Key::BestPerformance, Key::BestEfficiency, Key::LongerBattery}) {
+        const float width = Measure(T(Key::PowerModePrefix) + T(key), 11);
+        scheme = std::max(scheme, width);
+        legacyScheme = std::max(legacyScheme, width);
+    }
+    fullSchemeWidth_ = scheme;
+    scheme += Measure(T(Key::BatterySaverShort), 11) + 8;
     for (Key key : {Key::LowBattery, Key::Discharging, Key::Charging, Key::OnAc, Key::NoBattery, Key::Reading})
+        legacyChip = std::max(legacyChip, Measure(T(key), 11) + 16);
+    float chip = legacyChip;
+    for (Key key : {Key::AssistChip, Key::NotCharging})
         chip = std::max(chip, Measure(T(key), 11) + 16);
-    for (Key key : {Key::Balanced, Key::BestPerformance, Key::BestEfficiency, Key::LongerBattery})
-        scheme = std::max(scheme, Measure(T(Key::PowerModePrefix) + T(key), 11));
-    fullWidth_ = std::max(320.0f, 50 + chip + 8 + scheme);
+    const float headerLimit = std::max(320.0f, 50 + legacyChip + 8 + legacyScheme);
+    fullWidth_ = std::min(headerLimit, std::max(320.0f, 50 + chip + 8 + scheme));
     float hardware = 60;
     for (Key key : {Key::Cpu, Key::Gpu, Key::Memory, Key::Processor})
         hardware = std::max(hardware, Measure(T(key), 11) + 2);
     hardware = std::max(hardware, Measure(T(Key::WholeChip), 10.5f) + 2);
+    for (Key key : {Key::MeterWarmup, Key::MeterNoCounter, Key::MeterNoDomain, Key::MeterReadFailed})
+        hardware = std::max(hardware, std::max(Measure(T(key), 10.5f),
+            Measure(T(key), 10.5f, false, true)) + 2);
+    hardware = std::max(hardware, Measure(L"999.9" + T(Key::WattSuffix), 10.5f) + 2);
     fullWidth_ = std::max(fullWidth_, 50 + hardware * 4 + 30);
     fullWidth_ = std::max(fullWidth_, 50 + systemLabelWidth_ + Measure(L"999.9 / 999.9" + T(Key::GbSuffix), 12));
-    for (Key key : {Key::FullyCharged, Key::AcPower, Key::NoBatteryDetected, Key::Calculating, Key::Reading})
+    for (Key key : {Key::FullyCharged, Key::AcPower, Key::NoBatteryDetected, Key::Calculating, Key::Reading,
+                    Key::NotCharging})
         fullWidth_ = std::max(fullWidth_, 138 + Measure(T(key), 19, true));
     for (Key key : {Key::SinceLaunch, Key::SinceUnplugged})
         fullWidth_ = std::max(fullWidth_, 50 + Measure(T(key) + L"99+ " + T(Key::Hours) +
@@ -779,10 +804,13 @@ void Renderer::UpdateCompactLayout() {
             value(T(Key::TimeLeft), L"99+" + T(Key::HourSuffix));
             cell.width = std::max(cell.width, std::max(Measure(T(Key::FullyCharged), 13, true, true),
                                                      Measure(T(Key::NotCharging), 13, true, true)) + 2);
+            cell.width = std::max(cell.width, Measure(T(Key::AssistChip), 13, true, true) + 2);
             break;
         case CompactComponent::Power:
             value(T(Key::System), L"999.9" + T(Key::WattSuffix));
-            value(T(Key::CompactProcessor), L"999.9" + T(Key::WattSuffix)); break;
+            value(T(Key::CompactProcessor), L"999.9" + T(Key::WattSuffix));
+            value(T(Key::Battery), L"999.9" + T(Key::WattSuffix));
+            value(T(Key::Power), L"999.9" + T(Key::WattSuffix)); break;
         case CompactComponent::Cpu: value(T(Key::Cpu), L"100%"); break;
         case CompactComponent::Memory: value(T(Key::Memory), L"100%"); break;
         case CompactComponent::Gpu: value(T(Key::Gpu), L"100%"); break;
@@ -836,22 +864,24 @@ void Renderer::CompactContent(const View& v) {
         case CompactComponent::Battery: {
             const std::wstring text = v.percent + L"%";
             const bool charging = v.mode == PowerMode::Charging;
-            const bool plugged = v.mode == PowerMode::AcIdle;
+            const bool plugged = v.acOnline && (v.mode == PowerMode::AcIdle || v.supplemental);
             const bool ac = charging || plugged;
-            brush_->SetColor(ac ? Charge : Muted);
+            const auto batteryInk = v.supplemental ? Drain : ac ? Charge : Muted;
+            brush_->SetColor(batteryInk);
             target_->DrawRoundedRectangle(D2D1::RoundedRect(Rect(x, 15, 18, 10), 2.5f, 2.5f), brush_.Get(), 1.5f);
-            Rounded(Rect(x + 20, 18, 2, 4), 1, ac ? Charge : Muted);
+            Rounded(Rect(x + 20, 18, 2, 4), 1, batteryInk);
             if (v.battery > 0)
                 Rounded(Rect(x + 1.5f, 16.5f, 15 * v.battery, 7), 1,
-                        ac ? Alpha(Charge, .20f) : BatteryColor(v));
+                        v.supplemental ? Alpha(Drain, .20f) : ac ? Alpha(Charge, .20f) : BatteryColor(v));
             if (charging) Bolt(x + 4, 14, 12, Charge);
             else if (plugged) {
-                Line(x + 6.5f, 17, x + 6.5f, 20, Charge, 1.2f);
-                Line(x + 11.5f, 17, x + 11.5f, 20, Charge, 1.2f);
-                Line(x + 6.5f, 20, x + 11.5f, 20, Charge, 1.5f);
-                Line(x + 9, 20, x + 9, 23, Charge, 1.5f);
+                const auto plug = v.supplemental ? Drain : Charge;
+                Line(x + 6.5f, 17, x + 6.5f, 20, plug, 1.2f);
+                Line(x + 11.5f, 17, x + 11.5f, 20, plug, 1.2f);
+                Line(x + 6.5f, 20, x + 11.5f, 20, plug, 1.5f);
+                Line(x + 9, 20, x + 9, 23, plug, 1.5f);
             }
-            Text(text, Rect(x + 26, 8, width - 26, 24), 13, ac ? Charge : TextColor, true, true);
+            Text(text, Rect(x + 26, 8, width - 26, 24), 13, v.supplemental ? Drain : ac ? Charge : TextColor, true, true);
             break;
         }
         case CompactComponent::Eta: {

@@ -13,12 +13,12 @@ Pulse is a floating desktop widget for Windows that can also live in the taskbar
 
 By default, Full mode shows the following from top to bottom:
 
-- CPU / GPU / Memory / Processor: four tiles showing CPU, GPU (3D engine), and Memory usage and power, plus Processor power for the entire processor package (Whole chip). Memory power comes from RAPL DRAM.
-- Battery: charging or discharging power, smoothed estimates of Time left or Full in, To 20%, and average power since unplugging. If Pulse starts while on battery, the average is measured from startup.
+- CPU / GPU / Memory / Processor: usage for CPU, the GPU 3D engine, and memory. Power comes from the Energy Meter package, pp0, pp1 (graphics domain), and DRAM. pp1 is graphics-domain energy, not discrete-GPU board watts, and it may not be the same adapter as the GPU-usage figure. A missing counter, no matching instance, warmup, or a failed read shows "--" with a short reason, never a fake 0 W.
+- Battery: Full mode shows the Control Panel power plan's actual name ("Power plan · …"). With the system Balanced plan and a non-balanced Windows power mode, it shows "Power mode · Best performance / Best efficiency / Longer battery life" instead. Custom system plan names are left as-is. Battery saver is a short tag beside the name and does not replace it. Charge or discharge watts, smoothed Time left or Full in, To 20%, and the average since unplugging are calculated only for confirmed on-battery discharge or normal charging. External power with the battery still discharging is labeled "AC + battery"; the battery card shows net discharge and does not guess that the adapter is faulty. Discharge below 1 W or lasting less than 10 seconds is shown as connected to AC power. Once confirmed, discharge stays indicated through brief rate drops and exits after 5 seconds below the threshold; unplugging, charging, or a failed read exits immediately. If Pulse starts during confirmed on-battery discharge, the average is measured from startup.
 - Network: upload and download speeds for physical network adapters only, with prominent HTTP Latency and Offline status.
 - Top processes by CPU usage, excluding Pulse itself. Pulse's own usage is shown separately.
 
-Mini mode is a single line that can show Battery %, Time left or Full in, a charging lightning indicator, and an external-power indicator. Its Power component and Full mode's Power chart show battery discharge power under the label System while discharging. In other power states they show processor package power, labeled CPU pkg in Mini mode and Processor in Full mode. The fourth hardware tile is always labeled Processor.
+Mini mode is a single line that can show Battery %, Time left or Full in, a charging lightning indicator, and an external-power indicator. Power and the Full-mode chart use the label System only when external power is known to be offline and the battery is discharging. While plugged in, including external power with the battery still discharging, they stay on processor package power (CPU pkg in Mini mode, Processor in Full mode). Unknown external power is labeled Battery or unknown, never System. Switching sources breaks the chart so package and battery power are not connected. The fourth hardware tile is always labeled Processor.
 
 Taskbar mode embeds two rows of data in the taskbar, so it takes no desktop space. By default it shows Network speed, Time left / Full in, Power, CPU, Memory, and Latency:
 
@@ -66,8 +66,8 @@ Taskbar mode (light taskbar, Chinese interface, charging):
 
 - Windows 10 or Windows 11, 64-bit.
 - Runs as a standard user. Only FPS requires administrator privileges.
-- Hardware power comes from Energy Meter (RAPL) performance counters, without administrator privileges. Full mode prefers differences between `\Energy Meter(*)\Energy` samples and falls back to `\Energy Meter(*)\Power` if unavailable. Mini mode reads Power directly.
-- If the counters or the relevant instances are missing, the corresponding power values appear as unknown (`--`). Memory power requires a DRAM instance. Battery charging and discharging power comes from the Windows battery interface.
+- Hardware power comes from Energy Meter (RAPL) performance counters, without administrator privileges. Full mode prefers differences between `\Energy Meter(*)\Energy` samples (raw unit pWh; watts = delta × 3.6e-9 / seconds) and falls back to `\Energy Meter(*)\Power` (mW / 1000). Mini mode reads Power directly. This version does not call NVML or ADLX, and it does not treat D3DKMT adapter Power (0.1 percent) as watts.
+- If those counters are missing, no package / pp0 / pp1 / DRAM instance matches, or a read fails, the value stays unknown (`--`) with a short reason. One failure or a warmup is not treated as permanent absence. Memory power requires a DRAM instance. Battery charge and discharge power comes from the Windows battery interface; an unknown rate is not shown as 0 W.
 
 ## Installation
 
@@ -140,6 +140,7 @@ The window, the taskbar data, and the tray icon share this context menu:
 | Show items → Reset to defaults | Resets only the default component selections for all three modes |
 | Always on top | Toggles pinning the window above others |
 | Start with Windows | Toggles startup for the current user |
+| Power diagnostics | Starts a separate process that samples for about one second, writes the plan, signed battery rate, and Energy Meter instances to `%LOCALAPPDATA%\Pulse\power-diagnostics.txt`, and opens it. Nothing is uploaded and settings are not changed |
 | Open log | Opens the local log |
 | Restart as administrator (for FPS) | Appears when FPS is enabled in the current mode and administrator privileges are missing |
 | Exit | Exits the app |
@@ -216,7 +217,7 @@ See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 ## Disclaimer and privacy
 
 - This software is provided "as is", without warranty. You use it at your own risk, and the author is not liable for losses caused by its use. See [LICENSE](LICENSE) (MIT) for the governing terms.
-- Pulse reads system performance counters, battery information, processes, and network status. It changes system settings only when you choose Start with Windows. In a normal environment, runtime settings and logs are written only to `%LOCALAPPDATA%\Pulse`. Toggling Start with Windows writes or deletes the `Pulse` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`. The installer also copies the app and creates the shortcuts described above.
+- Pulse reads system performance counters, battery information, processes, and network status. It changes system settings only when you choose Start with Windows. In a normal environment, runtime settings and logs are written only to `%LOCALAPPDATA%\Pulse`. Running Power diagnostics also writes `power-diagnostics.txt`; it is not uploaded. Toggling Start with Windows writes or deletes the `Pulse` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`. The installer also copies the app and creates the shortcuts described above.
 - Network access is used only for latency measurement, by periodically requesting the three probe addresses listed above through the system proxy. Pulse does not collect or upload personal data over the network and has no analytics, telemetry, or automatic updates.
 - Logs are stored locally and are never uploaded.
 - Administrator privileges are used only for the FPS feature's ETW session. They are unnecessary if you do not need FPS.

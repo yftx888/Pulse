@@ -37,6 +37,7 @@ namespace {
 constexpr wchar_t MainClass[] = L"Pulse.Native.Main.v1";
 constexpr wchar_t SingleInstanceMutex[] = L"Local\\Pulse.Native.SingleInstance.v1";
 constexpr wchar_t RestartedArg[] = L"--restarted";
+constexpr wchar_t PowerDiagnosticsArg[] = L"--power-diagnostics";
 constexpr wchar_t ToastClass[] = L"Pulse.Native.Notification.v1";
 constexpr wchar_t RunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr int kAppIconId = 1;
@@ -51,6 +52,7 @@ constexpr UINT CmdFull = 101, CmdCompact = 102, CmdPin = 103, CmdStartup = 104;
 constexpr UINT CmdLog = 105, CmdExit = 106, CmdDefaults = 107, TrayId = 1;
 constexpr UINT CmdNetworkNotify = 108, CmdNotifySound = 109, CmdRestartAdmin = 110;
 constexpr UINT CmdShortcutDesktop = 111, CmdShortcutStartMenu = 112, CmdTaskbar = 113;
+constexpr UINT CmdPowerDiagnostics = 114;
 constexpr UINT CmdTaskbarComponent = 700;
 constexpr UINT CmdTaskbarPosition = 750;
 constexpr UINT CmdFullComponent = 200, CmdCompactComponent = 300;
@@ -652,7 +654,7 @@ public:
         ConfigureTaskbar();
         if (config_.mode == DisplayMode::Taskbar) TrackTaskbar(true);
         metrics_ = std::make_unique<Metrics>();
-        const Wants initialWants = CollectionWants(config_.components, CollectionMode(), details_, powerMode_);
+        const Wants initialWants = CollectionWants(config_.components, CollectionMode(), details_, powerTrace_);
         metrics_->SetWants(initialWants); // Always before Start and the first Sample, including --restarted.
         if (initialWants.fps) {
             diagnostics::WriteLog(L"FPS", L"ui startup wants=1 compact=" +
@@ -726,7 +728,7 @@ private:
     }
     void UpdateCollection() {
         if (!metrics_) return;
-        metrics_->SetWants(CollectionWants(config_.components, CollectionMode(), details_, powerMode_));
+        metrics_->SetWants(CollectionWants(config_.components, CollectionMode(), details_, powerTrace_));
         metrics_->SetProbeEnabled(ProbeNeeded());
     }
     void PositionDetails() {
@@ -892,9 +894,11 @@ private:
     Snapshot ReadMetrics() {
         auto sample = metrics_->Sample(!Cheap());
         fpsStatus_ = sample.fps_status;
-        if (powerMode_ != sample.mode) {
-            powerMode_ = sample.mode;
-            metrics_->SetWants(CollectionWants(config_.components, CollectionMode(), details_, powerMode_));
+        // sample.power_trace stays the observed value, including Unknown.
+        const PowerTrace next = NextCollectionTrace(powerTrace_, sample.power_trace);
+        if (powerTrace_ != next) {
+            powerTrace_ = next;
+            metrics_->SetWants(CollectionWants(config_.components, CollectionMode(), details_, powerTrace_));
         }
         return sample;
     }
@@ -1133,6 +1137,29 @@ private:
         }
         if (result <= 32) MessageBoxW(window_, T(Key::LogOpenFailed).c_str(), L"Pulse", MB_OK | MB_ICONINFORMATION);
     }
+    void StartPowerDiagnostics() {
+        const auto path = ExecutablePath();
+        if (path.empty()) {
+            MessageBoxW(window_, i18n::Format(Key::PowerDiagnosticsLaunchFailed, {L"0"}).c_str(),
+                T(Key::AppName).c_str(), MB_OK | MB_ICONWARNING);
+            return;
+        }
+        std::wstring command = L"\"" + path + L"\" ";
+        command += PowerDiagnosticsArg;
+        std::vector<wchar_t> mutableCommand(command.begin(), command.end());
+        mutableCommand.push_back(L'\0');
+        STARTUPINFOW startup{};
+        startup.cb = sizeof(startup);
+        PROCESS_INFORMATION process{};
+        if (!CreateProcessW(path.c_str(), mutableCommand.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr,
+                            &startup, &process)) {
+            MessageBoxW(window_, i18n::Format(Key::PowerDiagnosticsLaunchFailed,
+                {std::to_wstring(GetLastError())}).c_str(), T(Key::AppName).c_str(), MB_OK | MB_ICONWARNING);
+            return;
+        }
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+    }
     bool FpsNeedsAdmin() const {
         if (fpsStatus_ != 2) return false;
         if (TaskbarMode() && config_.components.taskbar[static_cast<size_t>(CompactComponent::Fps)]) return true;
@@ -1267,6 +1294,7 @@ private:
             if (!AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(shortcuts), T(Key::CreateShortcut).c_str()))
                 DestroyMenu(shortcuts);
         }
+        AppendMenuW(menu, MF_STRING, CmdPowerDiagnostics, T(Key::PowerDiagnostics).c_str());
         AppendMenuW(menu, MF_STRING, CmdLog, T(Key::OpenLog).c_str());
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         if (FpsNeedsAdmin())
@@ -1352,6 +1380,7 @@ private:
         case CmdShortcutDesktop: CreateShortcut(window_, FOLDERID_Desktop); break;
         case CmdShortcutStartMenu: CreateShortcut(window_, FOLDERID_Programs); break;
         case CmdLog: OpenLog(); break;
+        case CmdPowerDiagnostics: StartPowerDiagnostics(); break;
         case CmdRestartAdmin: RestartElevated(); break;
         case CmdExit: SendMessageW(window_, WM_CLOSE, 0, 0); break;
         }
@@ -1686,7 +1715,9 @@ private:
     std::unique_ptr<Metrics> metrics_;
     std::vector<std::unique_ptr<Toast>> toasts_;
     UINT dpi_ = 96, taskbarCreated_ = 0;
-    PowerMode powerMode_ = PowerMode::Unknown;
+    // Collection-source cache, not the displayed sample. Unknown means no
+    // source has been confirmed yet; a later Unknown sample does not clear it.
+    PowerTrace powerTrace_ = PowerTrace::Unknown;
     int fpsStatus_ = 0;
     bool active_ = false, running_ = false, stopping_ = false, fitting_ = false, dpiFitPending_ = false;
     bool zoomFitPending_ = false;
@@ -1705,9 +1736,9 @@ private:
 
 struct HandleCloser { void operator()(void* handle) const { if (handle) CloseHandle(handle); } };
 
-bool CommandHasRestarted(const wchar_t* commandLine) {
-    if (!commandLine) return false;
-    constexpr std::size_t restartedLen = sizeof(RestartedArg) / sizeof(wchar_t) - 1;
+bool CommandHasToken(const wchar_t* commandLine, const wchar_t* token) {
+    if (!commandLine || !token || !token[0]) return false;
+    const std::size_t tokenLen = std::wcslen(token);
     const wchar_t* p = commandLine;
     while (*p) {
         while (*p == L' ' || *p == L'\t') ++p;
@@ -1717,10 +1748,8 @@ bool CommandHasRestarted(const wchar_t* commandLine) {
         const wchar_t* start = p;
         if (quoted) while (*p && *p != L'"') ++p;
         else while (*p && *p != L' ' && *p != L'\t') ++p;
-        if (static_cast<std::size_t>(p - start) == restartedLen &&
-            std::wmemcmp(start, RestartedArg, restartedLen) == 0) {
-            return true;
-        }
+        if (static_cast<std::size_t>(p - start) == tokenLen &&
+            std::wmemcmp(start, token, tokenLen) == 0) return true;
         if (quoted && *p == L'"') ++p;
     }
     return false;
@@ -1795,8 +1824,28 @@ void EnableDpiAwareness() {
     SetProcessDPIAware();
 }
 
+int RunPowerDiagnostics() {
+    std::wstring path, error;
+    const int code = WritePowerDiagnosticsFile(&path, &error);
+    if (code != 0) {
+        const std::wstring message = i18n::Format(Key::PowerDiagnosticsFailed, {error.empty() ? L"?" : error});
+        MessageBoxW(nullptr, message.c_str(), T(Key::AppName).c_str(), MB_OK | MB_ICONERROR);
+        return code;
+    }
+    const auto opened = reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL));
+    if (opened > 32) return 0;
+    const std::wstring parameter = L"\"" + path + L"\"";
+    const auto notepad = reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", L"notepad.exe", parameter.c_str(), nullptr, SW_SHOWNORMAL));
+    if (notepad > 32) return 0;
+    MessageBoxW(nullptr, i18n::Format(Key::PowerDiagnosticsOpenFailed, {path}).c_str(),
+        T(Key::AppName).c_str(), MB_OK | MB_ICONINFORMATION);
+    return 0;
+}
+
 int Run(HINSTANCE instance, int showCommand, const wchar_t* commandLine) {
-    const bool restarted = CommandHasRestarted(commandLine);
+    // Before the single-instance mutex: this process only writes the report.
+    if (CommandHasToken(commandLine, PowerDiagnosticsArg)) return RunPowerDiagnostics();
+    const bool restarted = CommandHasToken(commandLine, RestartedArg);
     HANDLE mutex = CreateMutexW(nullptr, FALSE, SingleInstanceMutex);
     if (!mutex) {
         const DWORD openError = GetLastError();

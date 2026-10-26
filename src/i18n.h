@@ -194,6 +194,20 @@ enum class Key : std::size_t {
     TaskbarPositionMenu, TaskbarPositionAuto, TaskbarPositionRight, TaskbarPositionLeft,
     TaskbarFull,
     GpuTemp, Temperature, TaskbarGpuTemp,
+    PowerPlanPrefix,
+    PowerPlanUnknown,
+    AssistChip,
+    ExternalDischarge,
+    NetDischarge,
+    BatterySaverShort,
+    MeterWarmup,
+    MeterNoCounter,
+    MeterNoDomain,
+    MeterReadFailed,
+    PowerDiagnostics,
+    PowerDiagnosticsFailed,
+    PowerDiagnosticsOpenFailed,
+    PowerDiagnosticsLaunchFailed,
     Count
 };
 namespace detail {

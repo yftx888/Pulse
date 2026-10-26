@@ -22,6 +22,7 @@
 #endif
 
 #include "metrics.h"
+#include "power_diagnostics.h"
 #include "netprobe.h"
 
 #include <winsock2.h>
@@ -88,7 +89,6 @@ constexpr unsigned long long kGpuTempRetryMs = 30000;
 constexpr unsigned long long kGpuTempRediscoverMs = 60000;
 constexpr unsigned long long kWifiEveryMs = 10000;
 constexpr unsigned long long kBatteryHealthEveryMs = 600000;
-constexpr long kRateUnknownAbs = 500000;
 constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
 constexpr double kMiB = 1024.0 * 1024.0;
 bool IsPhysicalNic(const MIB_IF_ROW2& row) {
@@ -155,8 +155,8 @@ struct PulseKmtAdapterPerfData {
     ULONGLONG MaxMemoryFrequencyOC;
     ULONGLONG MemoryBandwidth;
     ULONGLONG PCIEBandwidth;
-    ULONG FanRPM;
-    ULONG Power;       // 1 = 0.1% (one thousandth of full power).
+    ULONG FanRPM;      // Adapter fan only. This is not a general CPU or chassis fan.
+    ULONG Power;       // 1 = 0.1% of the adapter's own scale. Never convert this to watts.
     ULONG Temperature; // 1 = 0.1 degrees Celsius; 0 means unavailable.
     UCHAR PowerStateOverride;
 };
@@ -227,9 +227,11 @@ void PulseKmtCloseAdapters(const PulseKmtApi& api, std::vector<PulseKmtAdapterIn
 
 struct BatteryReading {
     bool present = false;
+    bool ac_known = false;
     bool ac = false;
     bool charging = false;
     bool discharging = false;
+    bool rate_known = false;
     double rate_mw = 0;
     double remaining_mwh = 0;
     double full_mwh = 0;
@@ -257,11 +259,6 @@ static_assert(sizeof(RawBatteryState) == 32, "SYSTEM_BATTERY_STATE size");
 static_assert(offsetof(RawBatteryState, MaxCapacity) == 8, "MaxCapacity offset");
 static_assert(offsetof(RawBatteryState, Rate) == 16, "Rate offset");
 
-double SanitizeRate(long rate) {
-    if (rate >= kRateUnknownAbs || rate <= -kRateUnknownAbs) return 0.0;
-    return static_cast<double>(rate);
-}
-
 bool ReadBattery(BatteryReading& out) {
     RawBatteryState bs{};
     SYSTEM_POWER_STATUS ps{};
@@ -270,10 +267,19 @@ bool ReadBattery(BatteryReading& out) {
     if (rc != 0) return false;
     if (!GetSystemPowerStatus(&ps)) return false;
     out.present = bs.BatteryPresent != 0;
-    out.ac = bs.AcOnLine != 0;
+    // ACLineStatus 255 is unknown. If it disagrees with SYSTEM_BATTERY_STATE,
+    // do not pick a side: the sample must not claim a confirmed AC line.
+    const bool nt_ac = bs.AcOnLine != 0;
+    if (ps.ACLineStatus == 0 || ps.ACLineStatus == 1) {
+        const bool status_ac = ps.ACLineStatus == 1;
+        out.ac_known = status_ac == nt_ac;
+        out.ac = out.ac_known && status_ac;
+    }
     out.charging = bs.Charging != 0;
     out.discharging = bs.Discharging != 0;
-    out.rate_mw = SanitizeRate(bs.Rate);
+    // Unknown sentinels stay unknown. Do not publish them as 0 W.
+    out.rate_known = BatteryRateKnown(bs.Rate);
+    out.rate_mw = out.rate_known ? static_cast<double>(bs.Rate) : 0.0;
     out.remaining_mwh = static_cast<double>(bs.RemainingCapacity);
     out.full_mwh = static_cast<double>(bs.MaxCapacity);
     out.percent = ps.BatteryLifePercent <= 100 ? static_cast<int>(ps.BatteryLifePercent) : -1;
@@ -283,6 +289,29 @@ bool ReadBattery(BatteryReading& out) {
 }
 
 using OverlayFn = DWORD(WINAPI*)(GUID*);
+using ActiveSchemeFn = DWORD(WINAPI*)(HKEY, GUID**);
+using FriendlyNameFn = DWORD(WINAPI*)(HKEY, const GUID*, const GUID*, const GUID*, UCHAR*, DWORD*);
+
+// Byte-capped Unicode read. A failed or empty name must not keep a previous plan.
+bool ReadPlanName(FriendlyNameFn fn, const GUID& guid, std::wstring& out) {
+    out.clear();
+    if (!fn) return false;
+    DWORD bytes = 0;
+    const DWORD first = fn(nullptr, &guid, nullptr, nullptr, nullptr, &bytes);
+    if ((first != ERROR_SUCCESS && first != ERROR_MORE_DATA) ||
+        bytes < sizeof(wchar_t) || bytes > 2048 || (bytes % sizeof(wchar_t)) != 0) return false;
+    std::vector<unsigned char> buffer(static_cast<std::size_t>(bytes) + sizeof(wchar_t), 0);
+    DWORD got = bytes;
+    if (fn(nullptr, &guid, nullptr, nullptr, buffer.data(), &got) != ERROR_SUCCESS) return false;
+    if (got > bytes) got = bytes;
+    const auto* text = reinterpret_cast<const wchar_t*>(buffer.data());
+    const std::size_t chars = got / sizeof(wchar_t);
+    std::size_t length = 0;
+    while (length < chars && text[length] != L'\0') ++length;
+    if (length == 0) return false;
+    out.assign(text, length);
+    return true;
+}
 
 bool SameGuid(const GUID& a, const GUID& b) {
     return std::memcmp(&a, &b, sizeof(GUID)) == 0;
@@ -364,13 +393,15 @@ int MatchScore(const wchar_t* name, const wchar_t* token) {
 }
 
 bool FormatArray(PDH_HCOUNTER counter, std::vector<unsigned char>& buffer, DWORD& count,
-                 DWORD format = PDH_FMT_DOUBLE) {
+                 DWORD format = PDH_FMT_DOUBLE, long* error = nullptr) {
+    if (error) *error = PDH_INVALID_HANDLE;
     if (!counter) return false;
     for (int attempt = 0; attempt < 3; ++attempt) {
         DWORD need = static_cast<DWORD>(buffer.size());
         count = 0;
         const PDH_STATUS status = PdhGetFormattedCounterArrayW(counter, format, &need, &count,
             reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_W*>(buffer.data()));
+        if (error) *error = status;
         if (status == ERROR_SUCCESS) return true;
         if (static_cast<DWORD>(status) != static_cast<DWORD>(PDH_MORE_DATA) ||
             need == 0 || need > (16u << 20)) return false;
@@ -1216,6 +1247,11 @@ struct Metrics::Impl {
     bool prev_valid_ = false;
     PowerMode prev_mode_ = PowerMode::Unknown;
     bool prev_ok_ = false;
+    bool prev_ac_known_ = false;
+    bool prev_ac_online_ = false;
+    bool prev_contested_ = false;
+    bool prev_pure_ = false;
+    AcDischargeDebounce ac_discharge_;
     bool have_ema_ = false;
     double ema_ = 0;
     unsigned long long unplug_tick_ = 0;
@@ -1228,7 +1264,14 @@ struct Metrics::Impl {
     bool scheme_ready_ = false;
     unsigned long long scheme_tick_ = 0;
     OverlayFn overlay_fn_ = nullptr;
-    bool overlay_tried_ = false;
+    ActiveSchemeFn active_fn_ = nullptr;
+    FriendlyNameFn friendly_fn_ = nullptr;
+    bool power_api_tried_ = false;
+    GUID active_guid_{};
+    bool have_active_guid_ = false;
+    bool active_valid_ = false;
+    std::wstring active_name_;
+    unsigned long long active_name_tick_ = 0;
 
     static void CALLBACK NicChanged(PVOID context, PMIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE) {
         auto* self = static_cast<Impl*>(context);
@@ -1283,6 +1326,7 @@ struct Metrics::Impl {
     double cpu_w_ = NAN;
     double gpu_w_ = NAN;
     double mem_w_ = NAN;
+    std::array<MeterStatus, 4> meter_status_{};
 
     bool gpu_ok_ = false;
     bool gpu_warmed_ = false;
@@ -1393,6 +1437,8 @@ private:
     void UpdateMem(Snapshot& s, bool detail);
     void UpdateBattery(Snapshot& s, unsigned long long now, double dt, bool has_dt);
     void UpdateScheme(unsigned long long now);
+    void UpdateActivePlan(unsigned long long now);
+    void LoadPowerApi();
     void UpdateEnergy(bool full, unsigned long long now);
     void UpdateGpu(bool full, unsigned long long now);
     void UpdateProcs(Snapshot& s, unsigned long long now);
@@ -1425,13 +1471,19 @@ private:
     OverlayFn Overlay();
 };
 
-OverlayFn Metrics::Impl::Overlay() {
-    if (overlay_tried_) return overlay_fn_;
-    overlay_tried_ = true;
+void Metrics::Impl::LoadPowerApi() {
+    if (power_api_tried_) return;
+    power_api_tried_ = true;
     HMODULE mod = GetModuleHandleW(L"powrprof.dll");
     if (!mod) mod = LoadLibraryW(L"powrprof.dll");
-    if (!mod) return nullptr;
+    if (!mod) return;
     overlay_fn_ = reinterpret_cast<OverlayFn>(GetProcAddress(mod, "PowerGetEffectiveOverlayScheme"));
+    active_fn_ = reinterpret_cast<ActiveSchemeFn>(GetProcAddress(mod, "PowerGetActiveScheme"));
+    friendly_fn_ = reinterpret_cast<FriendlyNameFn>(GetProcAddress(mod, "PowerReadFriendlyName"));
+}
+
+OverlayFn Metrics::Impl::Overlay() {
+    LoadPowerApi();
     return overlay_fn_;
 }
 
@@ -1587,91 +1639,137 @@ void Metrics::Impl::UpdateBattery(Snapshot& s, unsigned long long now, double dt
     diagnostics::ScopedTiming timing(L"Battery");
     BatteryReading cur{};
     const bool read_ok = ReadBattery(cur);
-    if (read_ok) {
-        bat_ = cur;
-        have_bat_ = true;
+    // A failed read must not keep claiming the previous AC line or rate.
+    // The pure-battery session itself stays put so one miss does not reset it;
+    // prev_ok_ blocks that gap from entering the average. Wake has no dt.
+    if (!read_ok) {
+        ac_discharge_.Update(false, true, now);
+        have_ema_ = false;
+        ema_ = 0.0;
+        prev_ok_ = false;
+        s.mode = PowerMode::Unknown;
+        s.percent = -1;
+        s.power_trace = PowerTrace::Unknown;
+        s.battery_rate_mw = NAN;
+        return;
     }
-    if (!have_bat_) return;
+    bat_ = cur;
+    have_bat_ = true;
+    BatterySample sample;
+    sample.read_ok = true;
+    sample.present = cur.present;
+    sample.ac_known = cur.ac_known;
+    sample.ac_online = cur.ac;
+    sample.charging = cur.charging;
+    sample.discharging = cur.discharging;
+    sample.rate_known = cur.rate_known;
+    sample.rate_mw = cur.rate_mw;
+    BatteryClassification classified = ClassifyBattery(sample);
+    const bool raw_supplemental = classified.supplemental;
+    const bool hard_exit = !cur.present || !classified.ac_known || !classified.ac_online ||
+        cur.charging || (classified.rate_valid && classified.rate_mw > 0.0);
+    const bool supplemental = ac_discharge_.Update(raw_supplemental, hard_exit, now);
+    if (supplemental) {
+        classified.mode = PowerMode::Discharging;
+        classified.supplemental = true;
+        classified.pure_battery = false;
+        classified.show_watts = classified.rate_valid && classified.rate_mw < 0.0;
+        classified.eta_discharge = classified.eta_charge = false;
+        classified.trace = PowerTrace::Package;
+    } else if (raw_supplemental) {
+        // Keep pending AC discharge out of watts, ETA and unplug statistics.
+        classified.mode = PowerMode::AcIdle;
+        classified.supplemental = false;
+        classified.show_watts = false;
+        classified.trace = PowerTrace::Package;
+    }
+    const bool session_changed = !prev_valid_ || !prev_ok_ || prev_mode_ != classified.mode ||
+        prev_ac_known_ != classified.ac_known || prev_ac_online_ != classified.ac_online ||
+        prev_contested_ != classified.contested || prev_pure_ != classified.pure_battery;
+    const double magnitude = classified.show_watts ? std::fabs(classified.rate_mw) : 0.0;
 
-    const double rate = bat_.rate_mw;
-    const double p = rate < 0.0 ? -rate : rate;
-    PowerMode mode = PowerMode::AcIdle;
-    if (!bat_.present) mode = PowerMode::NoBattery;
-    else if (rate < 0.0 || (bat_.discharging && !bat_.ac)) mode = PowerMode::Discharging;
-    else if (bat_.charging && rate > 0.0) mode = PowerMode::Charging;
-
-    if ((mode == PowerMode::Discharging || mode == PowerMode::Charging) && p > 0.0) {
-        if (!prev_valid_ || prev_mode_ != mode || !have_ema_ || !has_dt || !(dt > 0.0)) {
-            ema_ = p;
-            have_ema_ = true;
-        } else {
-            const double alpha = 1.0 - std::exp(-dt / kTauSec);
-            ema_ += alpha * (p - ema_);
-        }
+    if (classified.show_watts && (session_changed || !have_ema_ || !has_dt || !(dt > 0.0))) {
+        ema_ = magnitude;
+        have_ema_ = true;
+    } else if (classified.show_watts) {
+        const double alpha = 1.0 - std::exp(-dt / kTauSec);
+        ema_ += alpha * (magnitude - ema_);
     } else {
         have_ema_ = false;
         ema_ = 0.0;
     }
 
-    if (mode == PowerMode::Discharging) {
-        if (!prev_valid_ || prev_mode_ != PowerMode::Discharging) {
+    if (classified.pure_battery) {
+        if (!prev_pure_) {
             unplug_tick_ = now;
             since_start_ = !prev_valid_;
             energy_wh_ = 0.0;
             measured_s_ = 0.0;
-        } else if (has_dt && dt > 0.0 && dt <= kMaxGapSec && p > 0.0 && read_ok && prev_ok_) {
-            energy_wh_ += (p / 1000.0) * dt / 3600.0;
+        } else if (prev_ok_ && has_dt && dt > 0.0 && dt <= kMaxGapSec && classified.show_watts) {
+            energy_wh_ += (magnitude / 1000.0) * dt / 3600.0;
             measured_s_ += dt;
         }
     } else {
         unplug_tick_ = 0;
     }
-    prev_mode_ = mode;
-    prev_ok_ = read_ok;
-    prev_valid_ = true;
 
     double eta = NAN;
     double eta20 = NAN;
     double pph = NAN;
     bool from_system = false;
-    if (have_ema_ && ema_ > 0.0) {
-        if (mode == PowerMode::Discharging) {
-            eta = bat_.remaining_mwh / ema_ * 3600.0;
-            if (bat_.full_mwh > 0.0) {
-                pph = ema_ / bat_.full_mwh * 100.0;
-                if (bat_.percent > 20) {
-                    const double remain = (bat_.remaining_mwh - 0.2 * bat_.full_mwh) / ema_ * 3600.0;
+    if (have_ema_ && ema_ > 0.0 && cur.present) {
+        if (classified.eta_discharge) {
+            eta = cur.remaining_mwh / ema_ * 3600.0;
+            if (cur.full_mwh > 0.0) {
+                pph = ema_ / cur.full_mwh * 100.0;
+                if (cur.percent > 20) {
+                    const double remain = (cur.remaining_mwh - 0.2 * cur.full_mwh) / ema_ * 3600.0;
                     if (remain >= 0.0) eta20 = remain;
                 }
             }
-        } else if (mode == PowerMode::Charging && bat_.full_mwh > bat_.remaining_mwh) {
-            eta = (bat_.full_mwh - bat_.remaining_mwh) / ema_ * 3600.0;
-            if (bat_.full_mwh > 0.0) pph = ema_ / bat_.full_mwh * 100.0;
+        } else if (classified.eta_charge && cur.full_mwh > cur.remaining_mwh) {
+            eta = (cur.full_mwh - cur.remaining_mwh) / ema_ * 3600.0;
+            if (cur.full_mwh > 0.0) pph = ema_ / cur.full_mwh * 100.0;
         }
     }
-    if (mode == PowerMode::Discharging && !(eta >= 0.0) && bat_.life_s >= 0.0) {
-        eta = bat_.life_s;
+    if (UseSystemBatteryEta(classified, eta, cur.life_s)) {
+        eta = cur.life_s;
         from_system = true;
     }
-    if (mode == PowerMode::Discharging && bat_.percent >= 0 && bat_.percent <= 20) eta20 = 0.0;
+    if (classified.pure_battery && cur.percent >= 0 && cur.percent <= 20) eta20 = 0.0;
 
-    s.mode = mode;
-    s.percent = bat_.percent;
-    if ((mode == PowerMode::Discharging || mode == PowerMode::Charging) && p > 0.0) s.power_w = p / 1000.0;
+    s.mode = classified.mode;
+    s.percent = cur.percent;
+    s.power_w = classified.show_watts ? magnitude / 1000.0 : NAN;
     s.eta_s = eta;
     s.eta_from_system = from_system;
     s.eta20_s = eta20;
     s.pct_per_hour = pph;
-    s.battery_saver = bat_.saver;
-    if (bat_.present) s.remaining_wh = bat_.remaining_mwh / 1000.0;
-    if (bat_.present && bat_.full_mwh > 0.0) s.full_wh = bat_.full_mwh / 1000.0;
-    if (unplug_tick_ != 0) {
+    s.battery_saver = cur.saver;
+    if (cur.present) s.remaining_wh = cur.remaining_mwh / 1000.0;
+    if (cur.present && cur.full_mwh > 0.0) s.full_wh = cur.full_mwh / 1000.0;
+    if (classified.pure_battery && unplug_tick_ != 0) {
         s.on_battery_s = static_cast<double>(now - unplug_tick_) / 1000.0;
         s.on_battery_since_start = since_start_;
         if (s.on_battery_s > 0.0 && measured_s_ > kAvgMinSec) {
             s.avg_w = energy_wh_ / (measured_s_ / 3600.0);
         }
     }
+    s.ac_known = classified.ac_known;
+    s.ac_online = classified.ac_online;
+    s.battery_rate_valid = classified.rate_valid;
+    s.battery_rate_mw = classified.rate_mw;
+    s.battery_supplemental = classified.supplemental;
+    s.power_contested = classified.contested;
+    s.power_trace = classified.trace;
+
+    prev_mode_ = classified.mode;
+    prev_ac_known_ = classified.ac_known;
+    prev_ac_online_ = classified.ac_online;
+    prev_contested_ = classified.contested;
+    prev_pure_ = classified.pure_battery;
+    prev_ok_ = true;
+    prev_valid_ = true;
 }
 
 void Metrics::Impl::UpdateScheme(unsigned long long now) {
@@ -1681,9 +1779,43 @@ void Metrics::Impl::UpdateScheme(unsigned long long now) {
     scheme_tick_ = now;
     OverlayFn fn = Overlay();
     GUID guid{};
-    if (!fn || fn(&guid) != 0) return;
+    if (!fn || fn(&guid) != 0) {
+        scheme_kind_ = PowerSchemeKind::Unknown;
+        scheme_.clear();
+        return;
+    }
     scheme_kind_ = SchemeKind(guid);
     scheme_ = SchemeName(scheme_kind_);
+}
+
+void Metrics::Impl::UpdateActivePlan(unsigned long long now) {
+    diagnostics::ScopedTiming timing(L"Active power plan");
+    LoadPowerApi();
+    GUID* heap = nullptr;
+    if (!active_fn_ || active_fn_(nullptr, &heap) != ERROR_SUCCESS || !heap) {
+        if (heap) LocalFree(heap);
+        active_valid_ = false;
+        active_name_.clear();
+        have_active_guid_ = false;
+        return;
+    }
+    const GUID guid = *heap;
+    LocalFree(heap);
+    const bool changed = !have_active_guid_ || !SameGuid(guid, active_guid_);
+    active_guid_ = guid;
+    have_active_guid_ = true;
+    // The GUID is checked every full sample. The friendly name follows a rename
+    // on the same GUID at the existing five-second cadence.
+    if (!changed && active_valid_ && now - active_name_tick_ < kSchemeEveryMs) return;
+    active_name_tick_ = now;
+    std::wstring name;
+    if (!ReadPlanName(friendly_fn_, guid, name)) {
+        active_valid_ = false;
+        active_name_.clear();
+        return;
+    }
+    active_valid_ = true;
+    active_name_ = std::move(name);
 }
 
 bool Metrics::Impl::EnsureEnergy(bool full, unsigned long long now) {
@@ -1695,6 +1827,7 @@ bool Metrics::Impl::EnsureEnergy(bool full, unsigned long long now) {
     energy_counter_ = power_counter_ = energy_time_counter_ = nullptr;
     if (PdhOpenQueryW(nullptr, 0, &energy_query_) != ERROR_SUCCESS) {
         energy_query_ = nullptr;
+        meter_status_.fill(MeterStatus::CounterUnavailable);
         return false;
     }
     // Preserve compact mode's single Power counter and its existing cadence.
@@ -1711,6 +1844,7 @@ bool Metrics::Impl::EnsureEnergy(bool full, unsigned long long now) {
     if (!energy_counter_ && !power_counter_) {
         PdhCloseQuery(energy_query_);
         energy_query_ = nullptr;
+        meter_status_.fill(MeterStatus::CounterUnavailable);
         return false;
     }
     energy_ok_ = true;
@@ -1726,22 +1860,26 @@ bool Metrics::Impl::ReadEnergy(bool full) {
     pkg_power_counter_w_ = NAN;
     if (PdhCollectQueryData(energy_query_) != ERROR_SUCCESS) {
         energy_prev_ = {};
+        meter_status_.fill(MeterStatus::ReadFailed);
         return false;
     }
     const std::int64_t qpc = QpcNow();
     std::array<EnergyPoint, 4> current{};
     std::array<int, 4> best{};
     std::array<double, 4> watts{{NAN, NAN, NAN, NAN}};
+    std::array<bool, 4> energy_named{}, power_named{};
     DWORD count = 0;
-    if (full && RawArray(energy_counter_, pdh_buf_, count)) {
+    const bool energy_array_ok = full && RawArray(energy_counter_, pdh_buf_, count);
+    if (energy_array_ok) {
         const auto* items = reinterpret_cast<const PDH_RAW_COUNTER_ITEM_W*>(pdh_buf_.data());
         count = std::min(count, static_cast<DWORD>(pdh_buf_.size() / sizeof(PDH_RAW_COUNTER_ITEM_W)));
         for (DWORD i = 0; i < count; ++i) {
             const auto& item = items[i];
-            if (!item.szName || (item.RawValue.CStatus != PDH_CSTATUS_VALID_DATA &&
-                                item.RawValue.CStatus != PDH_CSTATUS_NEW_DATA)) continue;
+            if (!item.szName) continue;
             for (std::size_t d = 0; d < current.size(); ++d) {
                 const int score = EnergyScore(item.szName, d);
+                if (score > 0) energy_named[d] = true;
+                if (!MeterDataValid(item.RawValue.CStatus)) continue;
                 if (score <= best[d]) continue;
                 best[d] = score;
                 current[d] = {item.szName, static_cast<uint64_t>(item.RawValue.FirstValue), qpc};
@@ -1811,19 +1949,20 @@ bool Metrics::Impl::ReadEnergy(bool full) {
     energy_prev_ = std::move(current);
     // Full mode also exposes a same-collection Power reference for unit checks.
     // Compact mode keeps its existing single formatted Power-array read.
-    if (FormatArray(power_counter_, pdh_buf_, count)) {
+    std::array<int, 4> power_best{};
+    const bool power_format_ok = FormatArray(power_counter_, pdh_buf_, count);
+    if (power_format_ok) {
         const auto* items = reinterpret_cast<const PDH_FMT_COUNTERVALUE_ITEM_W*>(pdh_buf_.data());
         count = std::min(count, static_cast<DWORD>(pdh_buf_.size() / sizeof(PDH_FMT_COUNTERVALUE_ITEM_W)));
-        std::array<int, 4> power_best{};
         std::array<double, 4> power_watts{{NAN, NAN, NAN, NAN}};
         for (DWORD i = 0; i < count; ++i) {
             const auto& item = items[i];
             const double value = item.FmtValue.doubleValue;
-            if (!item.szName || (item.FmtValue.CStatus != PDH_CSTATUS_VALID_DATA &&
-                                item.FmtValue.CStatus != PDH_CSTATUS_NEW_DATA) ||
-                !std::isfinite(value) || value < 0 || value > 1.0e9) continue;
+            if (!item.szName) continue;
             for (std::size_t d = 0; d < watts.size(); ++d) {
                 const int score = EnergyScore(item.szName, d);
+                if (score > 0) power_named[d] = true;
+                if (!MeterDataValid(item.FmtValue.CStatus) || !MeterPowerValid(value)) continue;
                 if (score <= power_best[d]) continue;
                 power_best[d] = score;
                 power_watts[d] = value / 1000.0; // Power is mW.
@@ -1834,6 +1973,13 @@ bool Metrics::Impl::ReadEnergy(bool full) {
         for (std::size_t d = 0; d < watts.size(); ++d) {
             if (use_power[d]) watts[d] = power_watts[d];
         }
+    }
+    for (std::size_t d = 0; d < watts.size(); ++d) {
+        meter_status_[d] = ResolveMeterStatus(
+            {full && energy_counter_ != nullptr, energy_array_ok, energy_named[d]},
+            {power_counter_ != nullptr, power_format_ok, power_named[d]}, watts[d],
+            full && best[d] > 0 && !use_power[d]);
+        if (meter_status_[d] == MeterStatus::Valid) have_meter = true;
     }
     pkg_w_ = watts[0]; cpu_w_ = watts[1]; gpu_w_ = watts[2]; mem_w_ = watts[3];
     return have_meter;
@@ -1955,6 +2101,7 @@ void Metrics::Impl::ClearTurnedOff(Snapshot& s, const Wants& w) {
         s.pkg_power_from_energy = false;
         s.pkg_energy_delta_pwh = s.pkg_energy_interval_s = NAN;
         s.pkg_power_counter_w = NAN;
+        s.pkg_meter = s.cpu_meter = s.gpu_meter = s.mem_meter = MeterStatus::Off;
     }
     if (!w.gpu_usage) s.gpu_percent = NAN;
     if (!w.processes) {
@@ -1962,7 +2109,13 @@ void Metrics::Impl::ClearTurnedOff(Snapshot& s, const Wants& w) {
         s.self_cpu_percent = NAN;
     }
     if (!w.processes && !w.process_count) s.process_count = -1;
-    if (!w.power_scheme) { s.power_scheme.clear(); s.power_scheme_kind = PowerSchemeKind::Unknown; }
+    if (!w.power_scheme) {
+        s.power_scheme.clear();
+        s.power_scheme_kind = PowerSchemeKind::Unknown;
+        s.active_plan_valid = false;
+        s.active_plan_name.clear();
+        s.active_plan_balanced = false;
+    }
     if (!w.memory_detail) {
         s.mem_used_gb = NAN;
         s.mem_total_gb = NAN;
@@ -1999,6 +2152,7 @@ void Metrics::Impl::ClearTurnedOff(Snapshot& s, const Wants& w) {
 }
 
 void Metrics::Impl::ReleaseEnergy() {
+    meter_status_.fill(MeterStatus::Off);
     if (!energy_query_ && !energy_ok_ && !have_energy_due_ && !energy_retry_at_ &&
         std::isnan(pkg_w_) && std::isnan(cpu_w_) && std::isnan(gpu_w_) && std::isnan(mem_w_)) return;
     if (energy_query_) PdhCloseQuery(energy_query_);
@@ -2837,9 +2991,18 @@ Snapshot Metrics::Impl::Take(bool full) {
     UpdateBattery(s, now, dt, has_dt);
     if (wants.power_scheme) {
         UpdateScheme(now);
+        UpdateActivePlan(now);
         s.power_scheme = scheme_;
         s.power_scheme_kind = scheme_kind_;
-    } else scheme_ready_ = false;
+        s.active_plan_valid = active_valid_;
+        s.active_plan_name = active_name_;
+        const GUID balanced = MakeGuid(0x381b4222, 0xf694, 0x41f0,
+            0x96, 0x85, 0xff, 0x5b, 0xb2, 0x60, 0xdf, 0x2e);
+        s.active_plan_balanced = active_valid_ && have_active_guid_ && SameGuid(active_guid_, balanced);
+    } else {
+        scheme_ready_ = false;
+        active_name_tick_ = 0;
+    }
     if (wants.chip_power) {
         UpdateEnergy(full, now);
         s.pkg_w = pkg_w_;
@@ -2850,6 +3013,10 @@ Snapshot Metrics::Impl::Take(bool full) {
         s.pkg_energy_delta_pwh = pkg_delta_pwh_;
         s.pkg_energy_interval_s = pkg_interval_s_;
         s.pkg_power_counter_w = pkg_power_counter_w_;
+        s.pkg_meter = meter_status_[0];
+        s.cpu_meter = meter_status_[1];
+        s.gpu_meter = meter_status_[2];
+        s.mem_meter = meter_status_[3];
     }
     if (wants.gpu_usage) {
         UpdateGpu(full, now);
@@ -2915,6 +3082,410 @@ void Metrics::OnSuspend() { impl_->probe.OnSuspend(); }
 void Metrics::OnResume() {
     impl_->reset_intervals_.store(true, std::memory_order_release);
     impl_->probe.OnResume();
+}
+
+namespace {
+
+std::wstring DiagStatus(long status) {
+    wchar_t buffer[48]{};
+    std::swprintf(buffer, 48, L"%ld (0x%08lX)", status, static_cast<unsigned long>(status));
+    return buffer;
+}
+
+std::wstring DiagGuid(const GUID& guid) {
+    wchar_t buffer[64]{};
+    std::swprintf(buffer, 64, L"%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+        static_cast<unsigned long>(guid.Data1), static_cast<unsigned>(guid.Data2),
+        static_cast<unsigned>(guid.Data3), guid.Data4[0], guid.Data4[1], guid.Data4[2],
+        guid.Data4[3], guid.Data4[4], guid.Data4[5], guid.Data4[6], guid.Data4[7]);
+    return buffer;
+}
+
+std::wstring DiagVersion() {
+    wchar_t path[1024]{};
+    const DWORD length = GetModuleFileNameW(nullptr, path, 1024);
+    if (!length || length >= 1024) return L"unknown";
+    HMODULE library = LoadLibraryW(L"version.dll");
+    if (!library) return L"unknown";
+    using SizeFn = DWORD(WINAPI*)(LPCWSTR, LPDWORD);
+    using ReadFn = BOOL(WINAPI*)(LPCWSTR, DWORD, DWORD, LPVOID);
+    using QueryFn = BOOL(WINAPI*)(LPCVOID, LPCWSTR, LPVOID*, PUINT);
+    const auto sizeFn = reinterpret_cast<SizeFn>(GetProcAddress(library, "GetFileVersionInfoSizeW"));
+    const auto readFn = reinterpret_cast<ReadFn>(GetProcAddress(library, "GetFileVersionInfoW"));
+    const auto queryFn = reinterpret_cast<QueryFn>(GetProcAddress(library, "VerQueryValueW"));
+    std::wstring version = L"unknown";
+    DWORD handle = 0;
+    const DWORD bytes = sizeFn ? sizeFn(path, &handle) : 0;
+    if (bytes > 0 && bytes < (4u << 20) && readFn && queryFn) {
+        std::vector<unsigned char> block(bytes);
+        if (readFn(path, 0, bytes, block.data())) {
+            struct Head { DWORD signature, structVersion, fileMs, fileLs; };
+            void* value = nullptr;
+            UINT valueLen = 0;
+            if (queryFn(block.data(), L"\\", &value, &valueLen) && value && valueLen >= sizeof(Head)) {
+                Head head{};
+                std::memcpy(&head, value, sizeof(head));
+                if (head.signature == 0xFEEF04BDu) {
+                    wchar_t text[64]{};
+                    std::swprintf(text, 64, L"%u.%u.%u.%u",
+                        static_cast<unsigned>(HIWORD(head.fileMs)), static_cast<unsigned>(LOWORD(head.fileMs)),
+                        static_cast<unsigned>(HIWORD(head.fileLs)), static_cast<unsigned>(LOWORD(head.fileLs)));
+                    version = text;
+                }
+            }
+        }
+    }
+    FreeLibrary(library);
+    return version;
+}
+
+const wchar_t* TraceName(PowerTrace trace) {
+    switch (trace) {
+    case PowerTrace::Package: return L"package";
+    case PowerTrace::BatteryWhole: return L"battery-whole";
+    case PowerTrace::BatterySide: return L"battery-side";
+    default: return L"unknown";
+    }
+}
+
+struct DiagRaw {
+    std::wstring name;
+    long status = 0;
+    long long first = 0;
+    long long second = 0;
+    double power_mw = NAN; // Preserve formatted double, including NaN/Inf; never cast to integer.
+};
+
+bool CollectRaw(PDH_HCOUNTER counter, std::vector<DiagRaw>& out, long& array_status) {
+    out.clear();
+    array_status = PDH_INVALID_HANDLE;
+    if (!counter) {
+        return false;
+    }
+    std::vector<unsigned char> buffer(65536);
+    DWORD count = 0;
+    bool ok = false;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        DWORD need = static_cast<DWORD>(buffer.size());
+        count = 0;
+        const PDH_STATUS status = PdhGetRawCounterArrayW(counter, &need, &count,
+            reinterpret_cast<PDH_RAW_COUNTER_ITEM_W*>(buffer.data()));
+        array_status = status;
+        if (status == ERROR_SUCCESS) { ok = true; break; }
+        if (static_cast<DWORD>(status) != static_cast<DWORD>(PDH_MORE_DATA) || need == 0 || need > (16u << 20))
+            return false;
+        buffer.resize(std::max(static_cast<std::size_t>(need), buffer.size() * 2));
+    }
+    if (!ok) return false;
+    const auto* items = reinterpret_cast<const PDH_RAW_COUNTER_ITEM_W*>(buffer.data());
+    count = std::min(count, static_cast<DWORD>(buffer.size() / sizeof(PDH_RAW_COUNTER_ITEM_W)));
+    for (DWORD i = 0; i < count; ++i) {
+        DiagRaw row;
+        row.name = items[i].szName ? items[i].szName : L"";
+        row.status = items[i].RawValue.CStatus;
+        row.first = items[i].RawValue.FirstValue;
+        row.second = items[i].RawValue.SecondValue;
+        out.push_back(std::move(row));
+    }
+    return true;
+}
+
+}  // namespace
+
+std::wstring BuildPowerDiagnosticsReport() {
+    std::wstring report;
+    auto line = [&](const std::wstring& text) { report += text; report += L"\r\n"; };
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    wchar_t stamp[64]{};
+    std::swprintf(stamp, 64, L"%04u-%02u-%02u %02u:%02u:%02u",
+        now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond);
+    wchar_t modulePath[1024]{};
+    const DWORD moduleLength = GetModuleFileNameW(nullptr, modulePath, 1024);
+    modulePath[1023] = L'\0';
+    line(L"Pulse power diagnostics");
+    line(std::wstring(L"Time: ") + stamp);
+    line(std::wstring(L"Version: ") + DiagVersion());
+    line(std::wstring(L"Module: ") + (moduleLength && moduleLength < 1024 ? modulePath : L"unavailable (path failed or truncated)"));
+    line(L"Units: Energy counter raw value = picowatt-hours (pWh). watts = (delta pWh) * 3.6e-9 / QPC seconds.");
+    line(L"Units: Power counter = milliwatts (mW). watts = mW / 1000.");
+    line(L"D3DKMT_ADAPTER_PERFDATA.Power is 0.1 percent, not watts, and is not used as a fallback.");
+    line(L"D3DKMT_ADAPTER_PERFDATA.FanRPM is the adapter fan, not a general CPU fan, and is not read here.");
+    line(L"Domains: package=package0_pkg, cpu=pp0, graphics=pp1, memory=dram. pp1 is an EMI graphics domain, not discrete-GPU board power.");
+    line(L"GPU Engine utilization can come from a different adapter than pp1. This build does not call NVML or ADLX.");
+    line(L"");
+
+    HMODULE powerLib = GetModuleHandleW(L"powrprof.dll");
+    const bool loadedPower = powerLib == nullptr;
+    if (!powerLib) powerLib = LoadLibraryW(L"powrprof.dll");
+    const auto activeFn = powerLib ? reinterpret_cast<ActiveSchemeFn>(GetProcAddress(powerLib, "PowerGetActiveScheme")) : nullptr;
+    const auto friendlyFn = powerLib ? reinterpret_cast<FriendlyNameFn>(GetProcAddress(powerLib, "PowerReadFriendlyName")) : nullptr;
+    const auto overlayFn = powerLib ? reinterpret_cast<OverlayFn>(GetProcAddress(powerLib, "PowerGetEffectiveOverlayScheme")) : nullptr;
+    line(L"[Power plan]");
+    GUID* active = nullptr;
+    const DWORD activeStatus = activeFn ? activeFn(nullptr, &active) : ERROR_PROC_NOT_FOUND;
+    line(std::wstring(L"PowerGetActiveScheme: ") + DiagStatus(static_cast<long>(activeStatus)));
+    if (activeStatus == ERROR_SUCCESS && active) {
+        const GUID guid = *active;
+        LocalFree(active);
+        line(std::wstring(L"Active scheme GUID: ") + DiagGuid(guid));
+        std::wstring plan;
+        if (ReadPlanName(friendlyFn, guid, plan)) line(std::wstring(L"Friendly name: ") + plan);
+        else line(L"Friendly name: unavailable (query failed; no previous name is kept)");
+    } else {
+        if (active) LocalFree(active);
+        line(L"Friendly name: unavailable");
+    }
+    GUID overlay{};
+    const DWORD overlayStatus = overlayFn ? overlayFn(&overlay) : ERROR_PROC_NOT_FOUND;
+    line(std::wstring(L"PowerGetEffectiveOverlayScheme: ") + DiagStatus(static_cast<long>(overlayStatus)));
+    if (overlayStatus == ERROR_SUCCESS) {
+        line(std::wstring(L"Overlay GUID: ") + DiagGuid(overlay));
+        line(std::wstring(L"Overlay kind: ") + SchemeName(SchemeKind(overlay)));
+    }
+    line(L"The overlay is a performance preference. It is not the Control Panel power plan.");
+    line(L"");
+
+    line(L"[Battery]");
+    BatteryReading battery{};
+    const bool batteryOk = ReadBattery(battery);
+    line(batteryOk ? L"Read: success" : L"Read: failed; AC line and rate are not confirmed");
+    if (batteryOk) {
+        BatterySample sample;
+        sample.read_ok = true;
+        sample.present = battery.present;
+        sample.ac_known = battery.ac_known;
+        sample.ac_online = battery.ac;
+        sample.charging = battery.charging;
+        sample.discharging = battery.discharging;
+        sample.rate_known = battery.rate_known;
+        sample.rate_mw = battery.rate_mw;
+        const BatteryClassification classified = ClassifyBattery(sample);
+        line(std::wstring(L"Present: ") + (battery.present ? L"yes" : L"no"));
+        line(std::wstring(L"AC known/online: ") + (classified.ac_known ? L"yes" : L"no") +
+            L" / " + (classified.ac_online ? L"online" : L"offline"));
+        line(std::wstring(L"Charging flag: ") + (battery.charging ? L"1" : L"0"));
+        line(std::wstring(L"Discharging flag: ") + (battery.discharging ? L"1" : L"0"));
+        if (battery.rate_known) {
+            wchar_t rate[64]{};
+            std::swprintf(rate, 64, L"%.3f mW (signed; positive=charge, negative=discharge)", battery.rate_mw);
+            line(std::wstring(L"Rate: ") + rate);
+        } else line(L"Rate: unknown (not treated as 0 W)");
+        line(std::wstring(L"Classified trace: ") + TraceName(classified.trace));
+        line(std::wstring(L"Supplemental: ") + (classified.supplemental ? L"yes" : L"no"));
+        line(std::wstring(L"Pure battery: ") + (classified.pure_battery ? L"yes" : L"no"));
+        line(std::wstring(L"Contested: ") + (classified.contested ? L"yes" : L"no"));
+        line(L"Pure battery requires known offline AC and uncontested discharge. AC plus battery discharge is supplemental, not whole-machine power.");
+    }
+    line(L"");
+
+    line(L"[Energy Meter]");
+    PDH_HQUERY query = nullptr;
+    const PDH_STATUS openStatus = PdhOpenQueryW(nullptr, 0, &query);
+    line(std::wstring(L"PdhOpenQuery: ") + DiagStatus(openStatus));
+    PDH_HCOUNTER energy = nullptr, power = nullptr, meterTime = nullptr;
+    PDH_STATUS energyAdd = openStatus, powerAdd = openStatus, timeAdd = openStatus;
+    if (openStatus == ERROR_SUCCESS) {
+        energyAdd = PdhAddEnglishCounterW(query, L"\\Energy Meter(*)\\Energy", 0, &energy);
+        powerAdd = PdhAddEnglishCounterW(query, L"\\Energy Meter(*)\\Power", 0, &power);
+        timeAdd = PdhAddEnglishCounterW(query, L"\\Energy Meter(*)\\Time", 0, &meterTime);
+    }
+    if (energyAdd != ERROR_SUCCESS) energy = nullptr;
+    if (powerAdd != ERROR_SUCCESS) power = nullptr;
+    line(std::wstring(L"Add Energy (pWh): ") + DiagStatus(energyAdd));
+    line(std::wstring(L"Add Power (mW): ") + DiagStatus(powerAdd));
+    line(std::wstring(L"Add Time: ") + DiagStatus(timeAdd));
+    std::vector<DiagRaw> firstRaw, secondRaw, secondPower;
+    long firstArray = energyAdd, secondArray = energyAdd, powerArray = powerAdd;
+    PDH_STATUS firstCollect = openStatus == ERROR_SUCCESS ? PdhCollectQueryData(query) : openStatus;
+    line(std::wstring(L"Collect 1: ") + DiagStatus(firstCollect));
+    const std::int64_t qpc1 = QpcNow();
+    if (firstCollect == ERROR_SUCCESS && energy) {
+        CollectRaw(energy, firstRaw, firstArray);
+    } else if (firstCollect != ERROR_SUCCESS) firstArray = firstCollect;
+    line(std::wstring(L"Energy array 1 (add/collect status if skipped): ") + DiagStatus(firstArray));
+    if (openStatus == ERROR_SUCCESS) Sleep(1000);
+    PDH_STATUS secondCollect = openStatus == ERROR_SUCCESS ? PdhCollectQueryData(query) : openStatus;
+    const std::int64_t qpc2 = QpcNow();
+    line(std::wstring(L"Collect 2: ") + DiagStatus(secondCollect));
+    const double seconds = QpcSeconds(qpc2, qpc1);
+    {
+        wchar_t gap[64]{};
+        std::swprintf(gap, 64, L"QPC interval: %.3f s", seconds);
+        line(gap);
+    }
+    if (secondCollect == ERROR_SUCCESS) {
+        if (energy) CollectRaw(energy, secondRaw, secondArray);
+        std::vector<unsigned char> formatted(65536);
+        DWORD count = 0;
+        if (power && FormatArray(power, formatted, count, PDH_FMT_DOUBLE, &powerArray)) {
+            const auto* items = reinterpret_cast<const PDH_FMT_COUNTERVALUE_ITEM_W*>(formatted.data());
+            count = std::min(count, static_cast<DWORD>(formatted.size() / sizeof(PDH_FMT_COUNTERVALUE_ITEM_W)));
+            for (DWORD i = 0; i < count; ++i) {
+                DiagRaw row;
+                row.name = items[i].szName ? items[i].szName : L"";
+                row.status = items[i].FmtValue.CStatus;
+                row.power_mw = items[i].FmtValue.doubleValue;
+                secondPower.push_back(std::move(row));
+            }
+        }
+    } else {
+        secondArray = powerArray = secondCollect;
+    }
+    line(std::wstring(L"Energy array 2 (add/collect status if skipped): ") + DiagStatus(secondArray));
+    line(std::wstring(L"Power array (add/collect status if skipped): ") + DiagStatus(powerArray));
+    auto listEnergy = [&](const wchar_t* title, const std::vector<DiagRaw>& rows) {
+        line(title);
+        if (rows.empty()) line(L"  (no rows; consult add/collect/array status above)");
+        for (const auto& row : rows) {
+            wchar_t text[256]{};
+            std::swprintf(text, 256, L"  status=%ld first=%lld second=%lld name=",
+                row.status, row.first, row.second);
+            line(std::wstring(text) + row.name);
+        }
+    };
+    listEnergy(L"Raw Energy instances (sample 1, pWh):", firstRaw);
+    listEnergy(L"Raw Energy instances (sample 2, pWh):", secondRaw);
+    line(L"Power instances (formatted double, mW):");
+    if (secondPower.empty()) line(L"  (no rows; consult add/collect/array status above)");
+    for (const auto& row : secondPower) {
+        wchar_t text[128]{};
+        std::swprintf(text, 128, L"  status=%ld mW=%.6g name=", row.status, row.power_mw);
+        line(std::wstring(text) + row.name);
+    }
+    const wchar_t* domainName[] = {L"package", L"cpu", L"graphics", L"memory"};
+    bool graphics_match = false;
+    std::array<unsigned, 6> outcomes{};
+    // Prefer a valid matching row, then the same domain score used by normal sampling.
+    auto choose = [&](const std::vector<DiagRaw>& rows, std::size_t domain, bool formatted) {
+        const DiagRaw* chosen = nullptr;
+        int best = 0;
+        for (const auto& row : rows) {
+            int score = EnergyScore(row.name.c_str(), domain);
+            if (!score) continue;
+            if (MeterDataValid(row.status) && (!formatted || MeterPowerValid(row.power_mw))) score += 10;
+            if (score > best) { best = score; chosen = &row; }
+        }
+        return chosen;
+    };
+    line(L"Matched domains:");
+    for (std::size_t domain = 0; domain < 4; ++domain) {
+        const DiagRaw* after = choose(secondRaw, domain, false);
+        const DiagRaw* before = after ? nullptr : choose(firstRaw, domain, false);
+        if (after) {
+            for (const auto& row : firstRaw)
+                if (row.name == after->name) { before = &row; break; }
+        }
+        const DiagRaw* fallback = choose(secondPower, domain, true);
+        const MeterEvidence e{energy != nullptr, secondArray == ERROR_SUCCESS, before || after};
+        const MeterEvidence p{power != nullptr, powerArray == ERROR_SUCCESS, fallback != nullptr};
+        MeterEnergySample b, a;
+        if (before) b = {before->name, static_cast<std::uint32_t>(before->status), static_cast<std::uint64_t>(before->first)};
+        if (after) a = {after->name, static_cast<std::uint32_t>(after->status), static_cast<std::uint64_t>(after->first)};
+        const auto result = InterpretMeterDomain(e, p,
+            firstArray == ERROR_SUCCESS && before ? &b : nullptr, after ? &a : nullptr, seconds,
+            fallback ? static_cast<std::uint32_t>(fallback->status) : static_cast<std::uint32_t>(PDH_INVALID_DATA),
+            fallback ? fallback->power_mw : NAN);
+        ++outcomes[static_cast<std::size_t>(result.status)];
+        if (domain == 2) graphics_match = e.matched || p.matched;
+        line(std::wstring(L"  ") + domainName[domain] + L":");
+        if (after || before) line(L"    Energy name: " + (after ? after->name : before->name));
+        if (fallback) line(L"    Power name: " + fallback->name);
+        if (std::isfinite(result.energy_w)) {
+            wchar_t text[160]{};
+            std::swprintf(text, 160, L"    Energy: delta_pWh=%llu -> %.3f W",
+                static_cast<unsigned long long>(result.delta_pwh), result.energy_w);
+            line(text);
+        } else if (result.interval == MeterInterval::InvalidData) {
+            line(L"    Energy: invalid CStatus; no delta calculated (see raw rows).");
+        } else if (result.interval == MeterInterval::Unchanged) {
+            line(L"    Energy: unchanged; warmup/stale provider, not evidence of 0 W.");
+        } else if (result.interval == MeterInterval::Warmup || result.interval == MeterInterval::Reset) {
+            line(L"    Energy: warmup/reset/identity change; no valid same-name interval yet.");
+        } else line(L"    Energy: unavailable; consult add/collect/array status and instance names.");
+        if (std::isfinite(result.power_w)) {
+            wchar_t text[160]{};
+            std::swprintf(text, 160, L"    Power: %.6g mW / 1000 = %.3f W%ls", fallback->power_mw,
+                result.power_w, std::isfinite(result.energy_w) ? L" (reference)" : L" (fallback available)");
+            line(text);
+        } else line(L"    Power: unavailable; consult status, CStatus and value above.");
+        switch (result.status) {
+        case MeterStatus::Valid: line(L"    Result: valid source available."); break;
+        case MeterStatus::Warmup: line(L"    Result: warmup/unchanged; retry later."); break;
+        case MeterStatus::CounterUnavailable: line(L"    Result: counters unavailable."); break;
+        case MeterStatus::NoMatch: line(L"    Result: arrays read successfully, no matching domain name."); break;
+        default: line(L"    Result: read failed or invalid data; not evidence of missing hardware."); break;
+        }
+    }
+    if (query) PdhCloseQuery(query);
+    if (loadedPower && powerLib) FreeLibrary(powerLib);
+    line(L"");
+    line(L"[Why a value may be missing]");
+    if (openStatus != ERROR_SUCCESS) {
+        line(L"The PDH query could not be opened. This sample does not prove the hardware can never report power.");
+    } else if (energyAdd != ERROR_SUCCESS && powerAdd != ERROR_SUCCESS) {
+        line(L"Neither the Energy nor the Power counter could be added. Energy Meter data is unavailable on this boot.");
+        line(L"That usually means the EMI device did not expose the counter. It does not by itself prove every other interface is impossible.");
+    } else {
+        line(L"Domain counts: valid=" + std::to_wstring(outcomes[static_cast<std::size_t>(MeterStatus::Valid)]) +
+            L", warmup/unchanged=" + std::to_wstring(outcomes[static_cast<std::size_t>(MeterStatus::Warmup)]) +
+            L", read failed/invalid=" + std::to_wstring(outcomes[static_cast<std::size_t>(MeterStatus::ReadFailed)]) +
+            L", no matching name=" + std::to_wstring(outcomes[static_cast<std::size_t>(MeterStatus::NoMatch)]));
+        line(L"Energy and Power were matched independently. A valid Power-only domain is a usable mW-to-W fallback.");
+        line(L"An add, collect, array or CStatus failure is not proof that an instance or hardware is absent.");
+    }
+    if (graphics_match) {
+        line(L"A pp1 match is EMI graphics-domain data. It is not the board power of an RTX or other discrete GPU, and it may not be the adapter shown by GPU usage.");
+    } else {
+        line(L"No pp1 name was observed in the returned Energy/Power rows; if a read failed, presence is unknown. GPU usage can still be available from GPU Engine.");
+    }
+    line(L"Normal UI keeps unknown numbers as --. It does not substitute 0 W, D3DKMT Power, or an estimated total.");
+    return report;
+}
+
+int WritePowerDiagnosticsFile(std::wstring* path_out, std::wstring* error_out) {
+    auto fail = [&](const std::wstring& message, int code) {
+        if (error_out) *error_out = message;
+        return code;
+    };
+    wchar_t local[MAX_PATH]{};
+    const DWORD localLen = GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
+    if (localLen == 0 || localLen >= MAX_PATH) return fail(L"LOCALAPPDATA is unavailable.", 2);
+    const std::wstring directory = std::wstring(local) + L"\\Pulse";
+    const std::wstring path = directory + L"\\power-diagnostics.txt";
+    if (!CreateDirectoryW(directory.c_str(), nullptr)) {
+        const DWORD error = GetLastError();
+        if (error != ERROR_ALREADY_EXISTS)
+            return fail(L"Could not create the Pulse directory. Win32 error " + std::to_wstring(error), 2);
+    }
+    std::wstring report;
+    try {
+        report = BuildPowerDiagnosticsReport();
+    } catch (...) {
+        return fail(L"Collecting the diagnostic failed.", 3);
+    }
+    if (report.empty()) return fail(L"The diagnostic report was empty.", 3);
+    const int bytes = WideCharToMultiByte(CP_UTF8, 0, report.c_str(), static_cast<int>(report.size()),
+        nullptr, 0, nullptr, nullptr);
+    if (bytes <= 0) return fail(L"Could not encode the diagnostic as UTF-8.", 3);
+    std::string encoded(static_cast<std::size_t>(bytes), '\0');
+    if (WideCharToMultiByte(CP_UTF8, 0, report.c_str(), static_cast<int>(report.size()),
+        encoded.data(), bytes, nullptr, nullptr) != bytes)
+        return fail(L"Could not encode the complete diagnostic as UTF-8.", 3);
+    const HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+        return fail(L"Could not write power-diagnostics.txt. Win32 error " + std::to_wstring(GetLastError()), 2);
+    const unsigned char bom[] = {0xEF, 0xBB, 0xBF};
+    DWORD bomWritten = 0, bodyWritten = 0;
+    const bool bomOk = WriteFile(file, bom, sizeof(bom), &bomWritten, nullptr) && bomWritten == sizeof(bom);
+    const bool bodyOk = bomOk && WriteFile(file, encoded.data(), static_cast<DWORD>(encoded.size()), &bodyWritten, nullptr) &&
+        bodyWritten == static_cast<DWORD>(encoded.size());
+    CloseHandle(file);
+    if (!bomOk || !bodyOk) return fail(L"Writing power-diagnostics.txt failed.", 2);
+    if (path_out) *path_out = path;
+    if (error_out) error_out->clear();
+    return 0;
 }
 
 }  // namespace pulse

@@ -294,11 +294,11 @@ try {
     Write-Host ("已创建开始菜单快捷方式：`"{0}`"" -f $startLink)
 
     if ($createDesktop) {
-        $desktop = [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::Desktop)
-        if ([string]::IsNullOrWhiteSpace($desktop)) {
+        $desktopFolder = [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::Desktop)
+        if ([string]::IsNullOrWhiteSpace($desktopFolder)) {
             Fail '无法确定桌面目录。'
         }
-        $desktopLink = Join-Path $desktop 'Pulse.lnk'
+        $desktopLink = Join-Path $desktopFolder 'Pulse.lnk'
         New-PulseShortcut -ShortcutPath $desktopLink -Target $dest
         Write-Host ("已创建桌面快捷方式：`"{0}`"" -f $desktopLink)
     } else {

@@ -107,6 +107,7 @@ private:
     struct CompactCell { float width = 0, labelWidth = 0; };
     std::array<CompactCell, CompactComponents.size()> compactCells_{};
     float compactWidth_ = 51, fullWidth_ = 320;
+    float fullSchemeWidth_ = 0;
     float networkLabelWidth_ = 32, latencyLabelWidth_ = 34, systemLabelWidth_ = 84;
     float readLabelWidth_ = 20, writeLabelWidth_ = 20;
     bool chartVisible_ = false, compact_ = false, fullPanel_ = true, software_ = false;

@@ -77,7 +77,7 @@ struct Components {
     bool Enabled(CompactComponent c) const { return compact[static_cast<std::size_t>(c)]; }
 };
 Wants CollectionWants(const Components& components, DisplayMode mode, bool details = false,
-                      PowerMode power = PowerMode::Unknown);
+                      PowerTrace trace = PowerTrace::Unknown);
 
 struct Speed {
     std::wstring value, unit;
@@ -98,16 +98,20 @@ struct Process {
 // Canonical display values. Only enabled components are populated or compared.
 struct View {
     PowerMode mode = PowerMode::Unknown;
+    PowerTrace powerTrace = PowerTrace::Unknown;
     NetState netState = NetState::Checking;
     bool low = false;
+    bool supplemental = false;
+    bool acOnline = false;
+    bool batterySaver = false;
     bool compactEtaVisible = false, compactEtaFromSystem = false;
     float battery = -1, cpu = -1, gpu = -1, memory = -1, disk = -1, wifi = -1;
-    std::wstring clock, chip, scheme, percent, etaLabel, heroWord;
+    std::wstring clock, chip, scheme, saverLabel, percent, etaLabel, heroWord;
     std::vector<TimePart> hero;
     std::wstring wattLabel, watt, pphLabel, pph, eta20, foot;
     std::wstring totals, selfCpu, powerLabel, powerValue; // Shared by compact power and the chart.
     std::wstring compactEtaLabel, compactEtaValue;
-    std::wstring cpuValue, memoryValue, packageW, cpuW, gpuW, memW, gpuUsage;
+    std::wstring cpuValue, memoryValue, packageW, packageNote, cpuW, gpuW, memW, gpuUsage;
     std::wstring latency, netHint, compactUp, compactDown, diskRead, diskWrite;
     std::wstring diskPercent, diskFree, cpuFrequency, memoryDetail, processCount, uptime;
     std::wstring sharedMemory, dedicatedMemory, wifiSsid, wifiSignal, health, cycles, fps;

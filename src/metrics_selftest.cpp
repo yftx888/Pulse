@@ -1,6 +1,7 @@
 // Console profiler: --samples N (default 60), --compact, --brief, --url URL,
 // --interval-ms 500|1000|2000, --switch-every N, --slow-ms 300|500|800, --fps,
-// --no-probe, --process-count-only, --gpu (five direct D3DKMT diagnostic rounds).
+// --no-probe, --process-count-only, --gpu (five direct D3DKMT diagnostic rounds),
+// --power (manual PDH/plan/battery report; does not start Metrics or the network).
 // Timings are per actual collection, not per cached Sample() call.
 // g++ -std=c++17 -O2 -municode -static -finput-charset=UTF-8 -fexec-charset=UTF-8
 //   -o metrics_selftest.exe src/metrics_selftest.cpp src/metrics.cpp src/netprobe.cpp src/fpsmon.cpp
@@ -220,6 +221,28 @@ bool CheckDurations() {
     return true;
 }
 
+const wchar_t* TraceName(pulse::PowerTrace trace) {
+    switch (trace) {
+    case pulse::PowerTrace::Unknown: return L"Unknown";
+    case pulse::PowerTrace::Package: return L"Package";
+    case pulse::PowerTrace::BatteryWhole: return L"BatteryWhole";
+    case pulse::PowerTrace::BatterySide: return L"BatterySide";
+    }
+    return L"?";
+}
+
+const wchar_t* MeterName(pulse::MeterStatus status) {
+    switch (status) {
+    case pulse::MeterStatus::Off: return L"Off";
+    case pulse::MeterStatus::Warmup: return L"Warmup";
+    case pulse::MeterStatus::CounterUnavailable: return L"CounterUnavailable";
+    case pulse::MeterStatus::NoMatch: return L"NoMatch";
+    case pulse::MeterStatus::ReadFailed: return L"ReadFailed";
+    case pulse::MeterStatus::Valid: return L"Valid";
+    }
+    return L"?";
+}
+
 const wchar_t* ModeName(pulse::PowerMode mode) {
     switch (mode) {
     case pulse::PowerMode::Unknown:
@@ -295,6 +318,20 @@ void PrintSample(int index, const pulse::Snapshot& s) {
     PrintDouble(L"remaining_wh", s.remaining_wh);
     PrintDouble(L"full_wh", s.full_wh);
     PrintBool(L"battery_saver", s.battery_saver);
+    PrintBool(L"ac_known", s.ac_known);
+    PrintBool(L"ac_online", s.ac_online);
+    PrintBool(L"battery_rate_valid", s.battery_rate_valid);
+    PrintDouble(L"battery_rate_mw", s.battery_rate_mw);
+    PrintBool(L"battery_supplemental", s.battery_supplemental);
+    PrintBool(L"power_contested", s.power_contested);
+    PrintText(L"power_trace", TraceName(s.power_trace));
+    PrintBool(L"active_plan_valid", s.active_plan_valid);
+    PrintBool(L"active_plan_balanced", s.active_plan_balanced);
+    PrintText(L"active_plan_name", s.active_plan_name);
+    PrintText(L"pkg_meter", MeterName(s.pkg_meter));
+    PrintText(L"cpu_meter", MeterName(s.cpu_meter));
+    PrintText(L"gpu_meter", MeterName(s.gpu_meter));
+    PrintText(L"mem_meter", MeterName(s.mem_meter));
     PrintText(L"power_scheme", s.power_scheme);
     PrintDouble(L"pkg_w", s.pkg_w);
     PrintDouble(L"cpu_w", s.cpu_w);
@@ -503,7 +540,7 @@ void OnNet(const pulse::NetEvent& event, void*) {
 int wmain(int argc, wchar_t** argv) {
     _setmode(_fileno(stdout), _O_U16TEXT);
     int samples = 60, interval_ms = 1000, switch_every = 0;
-    bool full = true, brief = false, fps_test = false, no_probe = false, count_only = false, gpu_test = false;
+    bool full = true, brief = false, fps_test = false, no_probe = false, count_only = false, gpu_test = false, power_test = false;
     pulse::Settings settings;
     for (int i = 1; i < argc; ++i) {
         if (std::wcscmp(argv[i], L"--compact") == 0) full = false;
@@ -511,6 +548,7 @@ int wmain(int argc, wchar_t** argv) {
         else if (std::wcscmp(argv[i], L"--no-probe") == 0) no_probe = true;
         else if (std::wcscmp(argv[i], L"--process-count-only") == 0) count_only = true;
         else if (std::wcscmp(argv[i], L"--gpu") == 0) gpu_test = true;
+        else if (std::wcscmp(argv[i], L"--power") == 0) power_test = true;
         else if (std::wcscmp(argv[i], L"--url") == 0 && i + 1 < argc)
             settings.probe_urls.emplace_back(argv[++i]);
         else if (std::wcscmp(argv[i], L"--slow-ms") == 0 && i + 1 < argc) {
@@ -536,9 +574,13 @@ int wmain(int argc, wchar_t** argv) {
             if (!end || *end || value < 1 || value > 86400) return 2;
             switch_every = static_cast<int>(value);
         } else {
-            std::wprintf(L"Usage: metrics_selftest.exe [--samples N] [--compact] [--brief] [--interval-ms 500|1000|2000] [--switch-every N] [--slow-ms 300|500|800] [--url URL ...] [--fps] [--gpu] [--no-probe] [--process-count-only]\n");
+            std::wprintf(L"Usage: metrics_selftest.exe [--samples N] [--compact] [--brief] [--interval-ms 500|1000|2000] [--switch-every N] [--slow-ms 300|500|800] [--url URL ...] [--fps] [--gpu] [--power] [--no-probe] [--process-count-only]\n");
             return 2;
         }
+    }
+    if (power_test) {
+        std::wprintf(L"%ls\n", pulse::BuildPowerDiagnosticsReport().c_str());
+        return 0;
     }
     if (gpu_test) return RunGpuTest();
     if (!CheckDurations()) return 1;
@@ -551,9 +593,9 @@ int wmain(int argc, wchar_t** argv) {
     const auto cpu_start = ProcessCpuTicks();
     {
         pulse::Metrics metrics;
-        const auto wants_for = [count_only](bool detailed, pulse::PowerMode mode) {
+        const auto wants_for = [count_only](bool detailed, pulse::PowerTrace trace) {
             pulse::Wants w;
-            w.chip_power = detailed || mode != pulse::PowerMode::Discharging;
+            w.chip_power = detailed || pulse::NeedsPackagePower(trace);
             w.gpu_usage = w.processes = detailed;
             w.memory_detail = w.disk_io = w.sys_disk = w.cpu_freq = detailed;
             w.uptime = w.gpu_memory = w.wifi = w.battery_health = detailed;
@@ -568,8 +610,8 @@ int wmain(int argc, wchar_t** argv) {
             }
             return w;
         };
-        pulse::PowerMode mode = pulse::PowerMode::Unknown;
-        metrics.SetWants(wants_for(full, mode));
+        pulse::PowerTrace trace = pulse::PowerTrace::Unknown;
+        metrics.SetWants(wants_for(full, trace));
         std::wprintf(L"mode=%ls samples=%d full_interval_ms=%d compact_interval_ms=2000 switch_every=%d log=%ls\n",
             full ? L"full" : L"compact", samples, interval_ms, switch_every, metrics.LogPath().c_str());
         std::wprintf(L"Energy raw: pWh; W = delta_pwh * 3.6e-9 / QPC_seconds. Compact/fallback: Power mW / 1000.\n");
@@ -580,9 +622,11 @@ int wmain(int argc, wchar_t** argv) {
         for (int i = 0; i < samples; ++i) {
             const bool detailed = switch_every && (i / switch_every) % 2 ? !full : full;
             if (i > 0) Sleep(detailed ? static_cast<DWORD>(interval_ms) : 2000u);
-            metrics.SetWants(wants_for(detailed, mode));
+            metrics.SetWants(wants_for(detailed, trace));
             const auto snapshot = metrics.Sample(detailed);
-            mode = snapshot.mode;
+            // Next sample keeps the last confirmed source. Printing still uses
+            // snapshot.power_trace, including Unknown after a failed battery read.
+            trace = pulse::NextCollectionTrace(trace, snapshot.power_trace);
             if (!brief) {
                 std::wprintf(L"collection_mode=%ls\n", detailed ? L"full" : L"compact");
                 PrintSample(i, snapshot);
