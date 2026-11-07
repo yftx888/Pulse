@@ -313,9 +313,11 @@ bool Model::Update(const Snapshot& s, bool compact, const Components& c, bool ta
             v.powerValue = batteryWatts ? Number(s.power_w, s.power_w >= 100 ? 0 : 1) : L"--";
         } else {
             v.powerTrace = s.power_trace;
-            v.powerLabel = compact ? T(Key::CompactProcessor) : T(Key::Processor);
-            v.powerValue = std::isfinite(s.pkg_w) && s.pkg_w >= 0.0 && s.pkg_w < 1.0e6
-                ? Number(s.pkg_w, s.pkg_w >= 100 ? 0 : 1) : L"--";
+            const bool system = std::isfinite(s.system_w) && s.system_w >= 0.0 && s.system_w < 1.0e6;
+            v.powerLabel = system ? T(Key::System) : compact ? T(Key::CompactProcessor) : T(Key::Processor);
+            const double watts = system ? s.system_w : s.pkg_w;
+            v.powerValue = std::isfinite(watts) && watts >= 0.0 && watts < 1.0e6
+                ? Number(watts, watts >= 100 ? 0 : 1) : L"--";
         }
     }
     if (hardware || (compact && c.Enabled(CompactComponent::Cpu))) v.cpuValue = Percent(s.cpu_percent, 0);
@@ -447,14 +449,19 @@ bool Model::Update(const Snapshot& s, bool compact, const Components& c, bool ta
             if (s.power_trace == PowerTrace::Unknown) {
                 if (view_.powerHistory.size() == 120) v.powerHistory = view_.powerHistory;
             } else {
+                // Package history switches between system and package watts; never join the two.
+                const bool system = !whole && !side &&
+                    std::isfinite(s.system_w) && s.system_w >= 0.0 && s.system_w < 1.0e6;
                 const bool sameSource = haveSample_ && !historyBroken_ && !compact_ &&
                     components_.Enabled(FullComponent::PowerChart) &&
-                    view_.powerTrace == s.power_trace && view_.powerHistory.size() == 120;
+                    view_.powerTrace == s.power_trace && view_.powerHistory.size() == 120 &&
+                    systemSource_ == system;
                 if (sameSource) v.powerHistory = view_.powerHistory;
                 else v.powerHistory.assign(120, -1);
                 std::move(v.powerHistory.begin() + 1, v.powerHistory.end(), v.powerHistory.begin());
-                const double point = (whole || side) ? s.power_w : s.pkg_w;
+                const double point = (whole || side) ? s.power_w : system ? s.system_w : s.pkg_w;
                 v.powerHistory.back() = ChartValue(point);
+                systemSource_ = system;
             }
         }
         if (network) {

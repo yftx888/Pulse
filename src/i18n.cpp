@@ -11,7 +11,9 @@
 #define _WIN32_WINNT 0x0A00
 #endif
 #include "i18n.h"
+#ifdef _WIN32
 #include <windows.h>
+#endif
 #include <cwchar>
 
 namespace pulse::i18n {
@@ -240,6 +242,13 @@ const Entry strings[] = {
     {L"下移", L"Move down"}, // MoveDown
     {L"移到最前", L"Move to first"}, // MoveFirst
     {L"移到最后", L"Move to last"}, // MoveLast
+    {L"菜单栏", L"Menu bar"}, // MacMenuBar
+    {L"详情面板", L"Details panel"}, // MacDetails
+    {L"登录时打开", L"Open at login"}, // MacOpenAtLogin
+    {L"请在系统设置的“登录项”中允许 Pulse。", L"Allow Pulse in Login Items in System Settings."}, // MacLoginApproval
+    {L"无法更新登录项。", L"Could not update the login item."}, // MacLoginFailed
+    {L"无法保存设置。", L"Could not save settings."}, // MacSettingsFailed
+    {L"选择文字颜色", L"Choose text color"}, // MacChooseColor
 };
 static_assert(sizeof(strings) / sizeof(strings[0]) == static_cast<std::size_t>(Key::Count), "i18n table size");
 Language current = Language::English;
@@ -264,9 +273,15 @@ const wchar_t* PreferenceValue(Preference value) {
     }
 }
 bool SetLanguage(Preference preference) {
+#ifdef _WIN32
     const Language language = preference == Preference::Chinese ? Language::Chinese :
         preference == Preference::English ? Language::English :
         PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_CHINESE ? Language::Chinese : Language::English;
+#else
+    const Language language = preference == Preference::Chinese ? Language::Chinese :
+        preference == Preference::English ? Language::English :
+        SystemPrefersChinese() ? Language::Chinese : Language::English;
+#endif
     if (current == language) return false;
     current = language;
     for (std::size_t i = 0; i < detail::active.size(); ++i)

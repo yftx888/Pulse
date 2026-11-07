@@ -2,6 +2,8 @@
 
 [English](README.en.md) | **简体中文**
 
+Apple Silicon 的 macOS 菜单栏版请看 [Mac 使用与构建说明](mac/README.md)。下文为 Windows 版说明。
+
 Pulse 是 Windows 桌面悬浮小组件，也可以嵌入任务栏：一个静态链接的 `Pulse.exe`，用原生 C++17、Win32 和 Direct2D 显示硬件、电池与网络状态。
 
 [下载最新版](https://github.com/yftx888/Pulse/releases/latest) · Windows 10 / 11 64 位 · 免安装

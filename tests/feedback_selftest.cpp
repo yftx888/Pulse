@@ -1196,6 +1196,80 @@ void CheckUiPreferences() {
     }
 }
 
+void CheckSystemPowerModel() {
+    using namespace pulse;
+    using namespace pulse::ui;
+    for (auto language : {i18n::Preference::Chinese, i18n::Preference::English}) {
+        i18n::SetLanguage(language);
+        for (bool compact : {true, false}) {
+            Components components = FullView();
+            Snapshot s = Base();
+            s.mode = PowerMode::AcIdle;
+            s.power_trace = PowerTrace::Package;
+            s.pkg_w = 1.2;
+            s.pkg_meter = MeterStatus::Valid;
+            s.system_w = 7.5;
+            Model model;
+            model.Update(s, compact, components);
+            ExpectEq(model.Data().powerLabel, T(Key::System), "system watts use whole-machine label in both modes");
+            ExpectEq(model.Data().powerValue, L"7.5", "system watts take precedence over package watts");
+            if (!compact) {
+                ExpectEq(model.Data().packageW, L"1.2", "hardware package watts remain IOReport watts");
+                Expect(NonNegative(model.Data().powerHistory) == 1 && model.Data().powerHistory.back() == 7.5f,
+                    "system chart uses whole-machine watts");
+            }
+            for (double invalid : {std::numeric_limits<double>::quiet_NaN(), -1.0, 1.0e6, std::numeric_limits<double>::infinity()}) {
+                s.system_w = invalid;
+                model.Update(s, compact, components);
+                ExpectEq(model.Data().powerLabel, compact ? T(Key::CompactProcessor) : T(Key::Processor),
+                    "invalid system watts retain Windows package label");
+                ExpectEq(model.Data().powerValue, L"1.2", "invalid system watts fall back to package watts");
+            }
+            s.system_w = 0;
+            model.Update(s, compact, components);
+            ExpectEq(model.Data().powerValue, L"0.0", "zero system watts are valid");
+            s.system_w = 7.5;
+            s.mode = PowerMode::Discharging;
+            s.ac_online = false;
+            s.battery_rate_valid = true;
+            s.battery_rate_mw = -4200;
+            s.power_trace = PowerTrace::BatteryWhole;
+            s.power_w = 4.2;
+            model.Update(s, compact, components);
+            ExpectEq(model.Data().powerLabel, T(Key::System), "battery trace keeps whole-machine label");
+            ExpectEq(model.Data().powerValue, L"4.2", "battery trace ignores external system watts");
+        }
+        Model chart;
+        const Components full = FullView();
+        Snapshot s = Base();
+        s.power_trace = PowerTrace::Package; s.pkg_w = 1.2; s.system_w = 7.5;
+        chart.Update(s, false, full);
+        chart.Update(s, false, full);
+        Expect(NonNegative(chart.Data().powerHistory) == 2, "same system source retains chart history");
+        s.system_w = NAN;
+        chart.Update(s, false, full);
+        Expect(NonNegative(chart.Data().powerHistory) == 1 &&
+            std::fabs(chart.Data().powerHistory.back() - 1.2f) < 0.0001f,
+            "system to package switch breaks chart history");
+        s.system_w = 7.5;
+        chart.Update(s, false, full);
+        Expect(NonNegative(chart.Data().powerHistory) == 1 && chart.Data().powerHistory.back() == 7.5f,
+            "package to system switch breaks chart history");
+    }
+    {
+        // Labels change with the language; the chart source does not.
+        Model chart;
+        const Components full = FullView();
+        Snapshot s = Base();
+        s.power_trace = PowerTrace::Package; s.pkg_w = 1.2;
+        i18n::SetLanguage(i18n::Preference::Chinese);
+        chart.Update(s, false, full);
+        i18n::SetLanguage(i18n::Preference::English);
+        chart.Update(s, false, full);
+        Expect(NonNegative(chart.Data().powerHistory) == 2, "language switch keeps package chart history");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -1209,6 +1283,21 @@ int main() {
     CheckCollectionTrace();
     CheckDgpu();
     CheckUiPreferences();
+    CheckSystemPowerModel();
+    // Windows retains the pre-existing history across one failed battery read.
+    for (auto trace : {pulse::PowerTrace::Package, pulse::PowerTrace::BatteryWhole}) {
+        pulse::ui::Model model;
+        auto s = Base();
+        const auto full = FullView();
+        s.power_trace = trace; s.pkg_w = 1.2; s.power_w = 4.2;
+        model.Update(s, false, full);
+        s.power_trace = pulse::PowerTrace::Unknown;
+        model.Update(s, false, full);
+        s.power_trace = trace;
+        model.Update(s, false, full);
+        Expect(NonNegative(model.Data().powerHistory) == 2,
+            "Windows source Unknown source preserves established chart history");
+    }
     if (g_fails) {
         std::printf("FAILED %d\n", g_fails);
         return 1;

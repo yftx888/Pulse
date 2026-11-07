@@ -1,0 +1,41 @@
+name: Build macOS
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apple-silicon:
+    name: Apple Silicon build and readout checks
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Verify native architecture
+        run: test "$(uname -m)" = arm64
+      - name: Build app and diagnostics
+        run: bash mac/build.sh
+      - name: Run readout logic checks
+        # Hosted VMs do not replace physical SMC, sleep or GUI acceptance.
+        run: bash mac/test.sh --logic-only
+      - name: Verify app signature
+        run: codesign --verify --strict mac/build/Pulse.app
+      - name: Upload build for review
+        uses: actions/upload-artifact@v7
+        with:
+          name: Pulse-mac-arm64
+          path: mac/build/Pulse-mac-arm64.zip
+          if-no-files-found: error
+          retention-days: 7

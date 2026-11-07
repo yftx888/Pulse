@@ -2,6 +2,8 @@
 
 **English** | [简体中文](README.md)
 
+For the Apple Silicon macOS menu bar app, see the [Mac build and usage guide](mac/README.md). The sections below describe the Windows version.
+
 Pulse is a floating desktop widget for Windows that can also live in the taskbar. A single statically linked `Pulse.exe`, built with native C++17, Win32, and Direct2D, displays hardware, battery, and network status.
 
 [Download the latest release](https://github.com/yftx888/Pulse/releases/latest) · Windows 10 / 11, 64-bit · No installation required
