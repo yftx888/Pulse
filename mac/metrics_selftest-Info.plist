@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>local.pulse.metrics-selftest</string>
+    <key>CFBundleExecutable</key>
+    <string>metrics_selftest</string>
+    <key>CFBundleName</key>
+    <string>Pulse metrics selftest</string>
+    <key>CFBundleVersion</key>
+    <string>0</string>
+    <!-- The probe intentionally supports HTTP test endpoints, including Settings URLs.
+         Embedded at link time; this tool never creates or edits a runtime plist. -->
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsArbitraryLoads</key>
+        <true/>
+    </dict>
+</dict>
+</plist>

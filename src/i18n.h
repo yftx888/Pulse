@@ -213,6 +213,7 @@ enum class Key : std::size_t {
     MiniTaskbar, RefreshOnePlain, RefreshFive, MiniOpacity,
     SelectAll, SelectNone, TextColor, ResetColors, Reorder,
     MoveUp, MoveDown, MoveFirst, MoveLast,
+    MacMenuBar, MacDetails, MacOpenAtLogin, MacLoginApproval, MacLoginFailed, MacSettingsFailed, MacChooseColor,
     Count
 };
 namespace detail {
@@ -222,6 +223,9 @@ extern std::array<const std::wstring*, static_cast<std::size_t>(Key::Count)> act
 inline const std::wstring& T(Key key) { return *detail::active[static_cast<std::size_t>(key)]; }
 Preference ParsePreference(const wchar_t* value);
 const wchar_t* PreferenceValue(Preference value);
+#ifndef _WIN32
+bool SystemPrefersChinese(); // Implemented by mac/system_language_mac.mm.
+#endif
 bool SetLanguage(Preference preference); // Resolve auto only at startup/settings changes.
 Language CurrentLanguage();
 const wchar_t* LocaleName();

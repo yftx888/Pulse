@@ -1,0 +1,3 @@
+# macOS source must remain LF when checked out alongside the Windows project.
+mac/** text eol=lf
+mac/*.icns binary

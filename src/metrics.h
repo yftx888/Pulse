@@ -122,6 +122,10 @@ struct Snapshot {
 
     DgpuStatus dgpu_status = DgpuStatus::Off;
     double dgpu_w = NAN; // Valid only when dgpu_status is Valid.
+
+    // Whole-machine load while external power is connected (macOS SMC PSTR), watts.
+    // Windows cannot measure it and always leaves NaN; the UI then shows package power.
+    double system_w = NAN;
 };
 
 // 网络探测事件（断网 / 恢复），由后端在探测线程里回调；界面负责弹提醒卡片、播放提示音。

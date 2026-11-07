@@ -20,3 +20,7 @@ CLAUDE.md
 docs/agent-tasks/
 docs/screenshots/python-*.png
 docs/promo/
+
+# macOS local build and validation output
+mac/build/
+mac-validation-*/

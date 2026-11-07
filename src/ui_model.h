@@ -148,6 +148,7 @@ private:
     View view_;
     Components components_;
     bool compact_ = false, haveSample_ = false, historyBroken_ = false;
+    bool systemSource_ = false; // The last chart point came from system_w (never on Windows).
 };
 
 std::wstring Number(double value, int decimals = 1);
